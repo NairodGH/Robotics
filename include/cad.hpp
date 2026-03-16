@@ -21,7 +21,6 @@ struct Vec3 {
         double length = len();
         return length > 1e-14 ? Vec3 { x / length, y / length, z / length } : Vec3 { 0, 0, 1 };
     }
-
     // returns true if this vector is within eps distance of 'other' (Euclidean)
     // used to detect duplicate vertices at loop seams and closing points
     // ex: (1,0,0).near((1,0,0.000001)) -> true (within default eps=1e-5)
@@ -42,18 +41,30 @@ struct AxisPlacement {
 // surface types we handle
 enum class SurfaceKind { Plane, Cylinder, Torus, Unknown };
 
+// holds everything needed to evaluate any of the three supported surface types at any point.
+// plane:    no radii, origin = any point on the plane, zDir = surface normal,
+//           xDir = one tangent direction (yDir is cross product, making up the full plane coord system)
+// cylinder: origin = any point on the axis, zDir = axis direction,
+//           xDir = zero-angle reference (where u=0 starts sweeping around)
+//           majorRadius = distance from axis to surface
+// torus:    picture a donut, origin = center of the hole, zDir = axis through the hole
+//           xDir = direction where u=0 starts (irrelevant for a full donut, matters for fillet patches)
+//           majorRadius = distance from donut center to tube centerline (size of the hole)
+//           minorRadius = radius of the tube itself (thickness of the dough) from where majorRadius ends up
+//           torus minorRadius plays the same role as cylinder majorRadius
 struct Surface {
     SurfaceKind kind = SurfaceKind::Unknown;
     AxisPlacement axis;
-    double majorRadius = 0; // cylinder: radius/torus: center->tube->center
-    double minorRadius = 0; // torus: tube radius
+    double majorRadius = 0;
+    double minorRadius = 0;
 };
 
-// one sampled boundary loop (closed ordered polyline)
+// a boundary loop is the outline of one face, a closed chain of edges that says "here is where this surface patch ends",
+// a face can have one outer loop and zero or more inner loops (holes)
 struct BoundaryLoop {
     std::vector<Vec3> points;
-    bool isOuter = false; // FACE_OUTER_BOUND vs FACE_BOUND (hole)
-    bool hasFullCircle = false; // any edge had vsId==veId -> full-revolution arc
+    bool isOuter = false; // FACE_OUTER_BOUND vs FACE_BOUND for ear-clipper, imagine a ring: true means it makes up the outer edge and false the inner one
+    bool hasFullCircle = false; // any edge where vertexStartId==vertexEndId means full-revolution arc (true)
 };
 
 // one tessellated face ready for GPU upload
@@ -72,7 +83,7 @@ using StepMap = std::unordered_map<int, StepEntity>;
 // final GPU model
 struct CadModel {
     std::vector<Mesh> meshes;
-    std::vector<Color> colors; // one per mesh, color-coded by surface type
+    std::vector<Color> colors; // one per mesh (index wise), color-coded by surface type
     BoundingBox bbox;
     ~CadModel();
 };

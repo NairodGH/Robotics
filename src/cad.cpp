@@ -282,9 +282,21 @@ static std::vector<Vec3> sampleBSpline(int id, Vec3 startPt, Vec3 endPt, const S
     if (entityIt == map.end())
         return { startPt, endPt };
     // B_SPLINE_CURVE_WITH_KNOTS params:
-    //   (name, degree, (ctrl_pts...), curve_form, closed_curve, self_intersect,
-    //    (knot_multiplicities...), (knots...), knot_spec)
+    //   (name, degree, (ctrl_pts...), curve_form, closed_curve, self_intersect, (knot_multiplicities...), (knots...), knot_spec)
     // ex degree-3 curve: "('', 3, (#60,#61,#62,#63), .UNSPECIFIED., .F., .F., (4,4), (0.,1.), .UNSPECIFIED.)"
+    // degree = how smoothly the track bends, 1 = straight line segments between posts, 2 = gentle bends,
+    //      3 = standard for CAD, smooth enough that you cannot feel the joints at all
+    // ctrl_pts = the posts you place in space that the track is attracted to but does not necessarily touch, move a post and the track bends toward it
+    //      4 control points = minimum for a degree-3 curve
+    //  curve_form means the overall shape family: .UNSPECIFIED., .CIRCULAR_ARC. or .ELLIPTIC_ARC. (informational only)
+    // closed_curve .F. means the track has a start and an end, .T. means it loops back on itself like a circuit (informational only)
+    // self_intersect .F. means the track never crosses itself, .T. means it does  (informational only)
+    // knot_multiplicities= how many times each knot value is repeated, with (4,4) means the first andl last knots aree repeated 4 times
+    //      repeating a knot degree times at each end is what forces the curve to actually start and end at the first and last control points respectively
+    //      rather than just being attracted to them, this is called a clamped B-spline
+    // knots = the actual knot values, (0., 1.) combined with the multiplicities this expands to (0, 0, 0, 0, 1, 1, 1, 1) which is our
+    //      8 values for 4 control points at degree 3, satisfying the n + degree + 1 rule
+    // knot_spec = knot distribution type (uniform, quasi-uniform...), .UNSPECIFIED. is almost always what you see in exported STEP files
     auto params = splitTopLevel(entityIt->second.params);
     if (params.size() < 3)
         return { startPt, endPt };
@@ -334,7 +346,7 @@ static std::vector<Vec3> sampleBSpline(int id, Vec3 startPt, Vec3 endPt, const S
 
     // De Boor's algorithm: evaluate the B-spline at parameter t
     // finds the knot span k such that knots[k] <= t < knots[k+1],
-    // then runs degree rounds of linear interpolation on the local control polygon.
+    // then runs degree rounds of linear interpolation on the local control polygon
     // ex: degree=3, t=0.5 on [0..1] -> picks the span containing 0.5, blends 4 local ctrl pts down to 1
     auto deBoor = [&](double t) -> Vec3 {
         // find knot span index (clamped to the last valid span)
@@ -997,8 +1009,7 @@ static TessellatedFace tessPlane(const Surface& surface, std::vector<BoundaryLoo
     int mergedVertexCount = (int)mergedPoly.size();
     // small offset along the normal to avoid z-fighting when two coplanar faces overlap
     // ex: top cap of a cylinder sits flush against a flat face at the same Z -> offset by 0.0005 units
-    const double zFightOffset = 5e-4;
-    Vec3 offsetVec = normal * zFightOffset;
+    Vec3 offsetVec = normal * 5e-4;
 
     // reconstruct 3D positions from 2D: pos3D = centroid + tangentX*u + tangentY*v
     // ex: u=2, v=1, centroid=(0,0,5), tangentX=(1,0,0), tangentY=(0,1,0) -> pos3D=(2,1,5)
@@ -1026,17 +1037,21 @@ static TessellatedFace tessellateAdvancedFace(int faceId, const StepMap& map, in
     if (faceIt == map.end())
         return {};
     // ADVANCED_FACE params: (name, (bound_refs...), surface_ref, orientation_flag)
-    // ex: "('', (#200,#201), #202, .T.)" -> 2 bounds, surface=#202, not reversed
+    // ex: "('', (#200,#201), #202, .T.)" means no name, boundary is described by two loops (the outer rim and an inner hole, entities #200 and #201),
+    // underlying surface geometry is entity #202 (which might be a CYLINDRICAL_SURFACE)
+    // .T. (true) means the normal direction matches the surface's own normal (not flipped)
     auto faceParams = splitTopLevel(faceIt->second.params);
     if (faceParams.size() < 3)
         return {};
 
+    // "what kind of surface is this and where is it in space"
     Surface surface = resolveSurface(stepRef(faceParams[2]), map);
     // orientation_flag ".F." means the face normal is opposite to the surface normal
     // ex: inner wall of a hollow cylinder has ".F." so the normal points inward
     bool faceReversed = (faceParams.size() >= 4 && trimWS(faceParams[3]) == ".F.");
 
-    // sample all boundary loops
+    // sample all boundary loops, converts the topological boundary description (a chain of edge references)
+    // into an actual ordered list of 3D points forming a closed polygon aka "what is the outline of this face"
     std::vector<BoundaryLoop> loops;
     for (auto& boundRef : splitTopLevel(unwrap(trimWS(faceParams[1])))) {
         int boundId = stepRef(trimWS(boundRef));
@@ -1045,6 +1060,7 @@ static TessellatedFace tessellateAdvancedFace(int faceId, const StepMap& map, in
             loops.push_back(std::move(loop));
     }
 
+    // takes the surface type + that outline and produces triangles = "how do I fill this face with geometry the GPU can render"
     switch (surface.kind) {
     case SurfaceKind::Cylinder:
         return tessCylinder(surface, loops, arcSegs);
@@ -1070,7 +1086,7 @@ static Color colorForKind(SurfaceKind kind)
     }
 }
 
-// allocates and fills a Raylib Mesh from a TessellatedFace, then uploads it to the GPU
+// allocates and fills a Raylib Mesh from a TessellatedFace, then uploads it from CPU RAM to the GPU's to draw it later
 // ex: face with 6 verts and 4 tris -> mesh.vertices=float[18], mesh.indices=ushort[12]
 static Mesh uploadMesh(const TessellatedFace& tessellatedFace)
 {
@@ -1089,6 +1105,9 @@ static Mesh uploadMesh(const TessellatedFace& tessellatedFace)
     memcpy(mesh.normals, tessellatedFace.normals.data(), vertexCount * 3 * sizeof(float));
     for (int i = 0; i < (int)tessellatedFace.indices.size(); i++)
         mesh.indices[i] = (unsigned short)tessellatedFace.indices[i];
+    // dynamic = false tells the GPU to put the mesh in static memory (VRAM that is optimized for read-many, write-never)
+    // true would put it in memory that is cheaper to update each frame, for things like skinned meshes or particle systems that change every frame
+    // STEP geometry never changes after load so go false
     UploadMesh(&mesh, false);
     return mesh;
 }
@@ -1116,12 +1135,13 @@ CadModel loadStep(const std::string& path, int arcSegs = 48)
             faceIds.push_back(id);
     std::sort(faceIds.begin(), faceIds.end());
 
+    // for each advanced face, by ID, go down its IDs nesting to resolve the face (shape) and add it to the model
     for (int faceId : faceIds) {
         TessellatedFace tessellatedFace = tessellateAdvancedFace(faceId, entityMap, arcSegs);
         if (tessellatedFace.indices.empty())
             continue;
         // expand the overall bounding box with all vertices of this face
-        // vertices are stored flat as [x0,y0,z0, x1,y1,z1, ...] -> step by 3
+        // vertices are stored flat as [x0,y0,z0, x1,y1,z1, ...] so step 3 by 3
         for (int i = 0; i + 2 < (int)tessellatedFace.vertices.size(); i += 3) {
             model.bbox.min.x = std::min(model.bbox.min.x, tessellatedFace.vertices[i]);
             model.bbox.min.y = std::min(model.bbox.min.y, tessellatedFace.vertices[i + 1]);
@@ -1139,20 +1159,25 @@ CadModel loadStep(const std::string& path, int arcSegs = 48)
     return model;
 }
 
-void drawCadModel(const CadModel& model, Matrix transform)
+void drawCadModel(const CadModel& model)
 {
     // translate so the model is centered at the origin before applying the caller's transform
     // this keeps orbit/zoom behavior symmetric regardless of where the STEP geometry is placed
     // ex: bbox min=(10,0,0), max=(20,0,0) -> center=(15,0,0), translate by (-15,0,0)
     Vector3 center
         = { (model.bbox.min.x + model.bbox.max.x) * 0.5f, (model.bbox.min.y + model.bbox.max.y) * 0.5f, (model.bbox.min.z + model.bbox.max.z) * 0.5f };
-    Matrix centeredTransform = MatrixMultiply(MatrixTranslate(-center.x, -center.y, -center.z), transform);
-    rlDisableBackfaceCulling(); // normals handle culling via double-sided geometry
+    Matrix centeredTransform = MatrixTranslate(-center.x, -center.y, -center.z);
+    // every triangle has a front and a back determined by winding order, the GPU normally throws away (culls) triangles whose back is facing the camera,
+    // this is an optimization since you never see the inside of a solid mesh, the problem here is that the tessellated faces have no consistent "outside",
+    // a plane face could be seen from either side depending on viewing angle, and the normals are what carry the lighting information (not the winding)
+    // so backface culling is disabled entirely and instead both a front and a back copy of every triangle are emitted with opposite normals
+    // so lighting is correct from both sides (tldr paying with twice the triangles instead of relying on the GPU cull to handle it)
+    rlDisableBackfaceCulling();
     for (int i = 0; i < (int)model.meshes.size(); i++) {
         Material material = LoadMaterialDefault();
         material.maps[MATERIAL_MAP_DIFFUSE].color = model.colors[i];
         DrawMesh(model.meshes[i], material, centeredTransform);
-        UnloadMaterial(material);
+        UnloadMaterial(material); // else will leak every frame for every mesh, not the most efficient but fine at this scale
     }
     rlEnableBackfaceCulling();
 }
@@ -1163,19 +1188,19 @@ int main()
     InitWindow(1280, 720, "CAD");
     SetTargetFPS(60);
 
+    // executable either at root or in build/Release but assets is always at root
     CadModel model = loadStep(std::filesystem::exists("assets") ? "assets/screw.step" : "../../assets/screw.step");
 
     Vector3 modelSize = { model.bbox.max.x - model.bbox.min.x, model.bbox.max.y - model.bbox.min.y, model.bbox.max.z - model.bbox.min.z };
-    // diagonal of the bounding box: used to scale camera distance and zoom speed so they
-    // feel consistent regardless of model size (1mm screw vs 1m bracket)
+    // diagonal of the bounding box, aka "diameter" from one corner to the opposite,
+    // used to scale camera distance and zoom speed so they feel consistent regardless of model size
     // ex: bbox 10x5x2 -> diagonal = sqrt(100+25+4) = 11.36
     float diagonal = sqrtf(modelSize.x * modelSize.x + modelSize.y * modelSize.y + modelSize.z * modelSize.z);
 
-    // orbit camera state
+    // default camera state, feel-tuned
     float yaw = 45.0f; // degrees, horizontal rotation
-    float pitch = -25.0f; // degrees, vertical rotation (clamped)
-    float orbitRadius = diagonal * 1.8f; // initial distance: 1.8x the diagonal gives a comfortable framing
-
+    float pitch = -25.0f; // degrees, vertical rotation
+    float orbitRadius = diagonal * 1.8f; // initial distance
     Camera3D camera = {};
     camera.target = { 0, 0, 0 };
     camera.up = { 0, 1, 0 };
@@ -1188,7 +1213,7 @@ int main()
             Vector2 mouseDelta = GetMouseDelta();
             yaw += mouseDelta.x * 0.4f; // 0.4 deg/pixel feel-tuned for typical screen DPI
             pitch -= mouseDelta.y * 0.4f; // subtract because screen Y is flipped relative to world Y
-            // clamp with 1 degree margin so that view matrix doesn't degerate if we go directly above/below target
+            // clamp with 1 degree margin off 90° so that view matrix doesn't degerate if we go directly above/below target
             if (pitch > 89.0f)
                 pitch = 89.0f;
             if (pitch < -89.0f)
@@ -1202,8 +1227,7 @@ int main()
         if (orbitRadius > diagonal * 10.f)
             orbitRadius = diagonal * 10.f;
 
-        // convert spherical (yaw, pitch, orbitRadius) to Cartesian camera position.
-        // standard spherical->Cartesian: x=r*cos(pitch)*sin(yaw), y=r*sin(pitch), z=r*cos(pitch)*cos(yaw)
+        // convert spherical (yaw, pitch, orbitRadius) to Cartesian camera position (x y z)
         // ex: yaw=90deg, pitch=0 -> camera sits on the +X axis looking toward origin
         float yawRadians = DEG2RAD * yaw;
         float pitchRadians = DEG2RAD * pitch;
@@ -1213,7 +1237,7 @@ int main()
         BeginDrawing();
         ClearBackground({ 18, 18, 22, 255 });
         BeginMode3D(camera);
-        drawCadModel(model, MatrixIdentity());
+        drawCadModel(model);
         EndMode3D();
         DrawText("RED = Cylinders", 20, 20, 16, RED);
         DrawText("GREEN = Tori (fillets)", 20, 40, 16, GREEN);
