@@ -82,6 +82,7 @@ StepMap parseStepFile(const std::string& path)
     static std::regex entityRegex(R"(#(\d+)\s*=\s*([A-Z0-9_]+)\s*\((.+)\)\s*;$)");
     while (std::getline(file, line)) {
         std::string trimmedLine = trimWS(line);
+        // all we care about is between "DATA;" and "ENDSEC;", skip if not (metadata)
         if (trimmedLine == "DATA;") {
             inData = true;
             continue;
@@ -275,6 +276,7 @@ static std::vector<Vec3> sampleCircle(int id, Vec3 startPt, Vec3 endPt, bool isC
 
 // evaluate a B_SPLINE_CURVE_WITH_KNOTS using De Boor's algorithm
 // each round takes the current set of local control points and replaces them with a smaller set of blended points, until one point remains
+// basically what De Casteljau's algorithm is to Bézier curves
 // it is numerically stable and the standard way to evaluate splines
 static std::vector<Vec3> sampleBSpline(int id, Vec3 startPt, Vec3 endPt, const StepMap& map, int segs = 16)
 {
@@ -383,6 +385,14 @@ static std::vector<Vec3> sampleBSpline(int id, Vec3 startPt, Vec3 endPt, const S
 
 #pragma region boundary loop
 // solver: FACE_OUTER_BOUND/FACE_BOUND -> EDGE_LOOP -> ORIENTED_EDGE -> EDGE_CURVE -> curve
+// FACE_OUTER_BOUND / FACE_BOUND = the declaration that a boundary exists and whether it is the outer rim or a hole,
+// it's just a wrapper that says "here comes a loop and it is of this kind", no geometry yet
+// EDGE_LOOP = the ordered list of edges that form the closed outline, "go around these edges in this order and you will have
+// traced the full boundary", still no geometry, just references
+// ORIENTED_EDGE = one edge, plus a flag saying which direction to traverse it, the same underlying edge can be shared by two adjacent faces (share a boundary)
+// but each face traverses it in the opposite direction, .F. / .T. flag handles that, still no geometry, just topology
+// EDGE_CURVE = the actual geometric edge: which two vertices it connects and which curve lies between them, real 3D positions and curve entity
+// curve = geometry itself, LINE or CIRCLE or B_SPLINE_CURVE_WITH_KNOTS, this is what gets sampled into actual 3D points
 static BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs)
 {
     BoundaryLoop loop;
