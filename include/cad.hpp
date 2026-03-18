@@ -88,6 +88,7 @@ struct CadModel {
     std::vector<TessellatedFace> pickData; // CPU copy kept after GPU upload, for mouse ray picking and analysis
     std::vector<Surface> faceSurfaces; // analytical surface definition per face, for axis/normal display
     std::vector<float> faceAreas;
+    std::vector<Vector3> faceOffsets; // per-face translation in draw space, applied on top of the centering transform at draw/query time
     int totalTriangleCount = 0;
     int selectedFace = -1;
     int distFace = -1;

@@ -1210,6 +1210,7 @@ CadModel loadStep(const std::string& path, int arcSegs = 48)
         model.pickData.push_back(tessellatedFace);
         model.faceSurfaces.push_back(faceSurface);
         model.faceAreas.push_back(computeFaceArea(tessellatedFace));
+        model.faceOffsets.push_back({ 0.0f, 0.0f, 0.0f });
         model.totalTriangleCount += (int)tessellatedFace.indices.size() / 6; // front triangles only
     }
     return model;
@@ -1238,7 +1239,11 @@ void drawCadModel(const CadModel& model)
     for (int i = 0; i < (int)model.meshes.size(); i++) {
         Material material = LoadMaterialDefault();
         material.maps[MATERIAL_MAP_DIFFUSE].color = model.colors[i];
-        DrawMesh(model.meshes[i], material, centeredTransform);
+        // per-face offset (draw-space translation) stacked on top of the centering transform
+        // ex: offset=(0,1,0) -> face shifts 1 unit upward in draw space after centering
+        Vector3 off = model.faceOffsets[i];
+        Matrix faceTransform = MatrixMultiply(MatrixTranslate(off.x, off.y, off.z), centeredTransform);
+        DrawMesh(model.meshes[i], material, faceTransform);
         UnloadMaterial(material); // else will leak every frame for every mesh, not the most efficient but fine at this scale
     }
     rlEnableBackfaceCulling();
@@ -1288,13 +1293,20 @@ static int pickFace(const CadModel& model, Ray ray)
     int hitFace = -1;
     for (int faceIndex = 0; faceIndex < (int)model.pickData.size(); faceIndex++) {
         const auto& faceData = model.pickData[faceIndex];
+        // offset is in draw space (post-centering), so add it to vertices in the same adjusted space
+        // equivalent to subtracting it from the ray origin per face, but cheaper to apply once to a local ray copy
+        Vector3 off = model.faceOffsets[faceIndex];
+        Ray faceRay = ray;
+        faceRay.position.x -= off.x;
+        faceRay.position.y -= off.y;
+        faceRay.position.z -= off.z;
         for (int i = 0; i + 2 < (int)faceData.indices.size(); i += 3) {
             // fetch the three vertex positions for this triangle from the flat XYZ array
             int i0 = faceData.indices[i] * 3, i1 = faceData.indices[i + 1] * 3, i2 = faceData.indices[i + 2] * 3;
             Vec3 v0 = { faceData.vertices[i0], faceData.vertices[i0 + 1], faceData.vertices[i0 + 2] };
             Vec3 v1 = { faceData.vertices[i1], faceData.vertices[i1 + 1], faceData.vertices[i1 + 2] };
             Vec3 v2 = { faceData.vertices[i2], faceData.vertices[i2 + 1], faceData.vertices[i2 + 2] };
-            float t = rayTriangleIntersect(ray, v0, v1, v2);
+            float t = rayTriangleIntersect(faceRay, v0, v1, v2);
             if (t > 0.0f && t < closestT) {
                 closestT = t;
                 hitFace = faceIndex;
@@ -1310,7 +1322,8 @@ static void drawSelectedFaceHighlight(const CadModel& model)
     if (model.selectedFace < 0 || model.selectedFace >= (int)model.meshes.size())
         return;
     Vector3 center = modelCenter(model);
-    Matrix centeredTransform = MatrixTranslate(-center.x, -center.y, -center.z);
+    Vector3 off = model.faceOffsets[model.selectedFace];
+    Matrix centeredTransform = MatrixMultiply(MatrixTranslate(off.x, off.y, off.z), MatrixTranslate(-center.x, -center.y, -center.z));
     rlDisableBackfaceCulling();
     Material solidMaterial = LoadMaterialDefault();
     solidMaterial.maps[MATERIAL_MAP_DIFFUSE].color = WHITE;
@@ -1330,7 +1343,8 @@ static void drawSelectedFaceHighlight(const CadModel& model)
 static void drawDistFaceHighlight(const CadModel& model)
 {
     Vector3 center = modelCenter(model);
-    Matrix centeredTransform = MatrixTranslate(-center.x, -center.y, -center.z);
+    Vector3 off = model.faceOffsets[model.distFace];
+    Matrix centeredTransform = MatrixMultiply(MatrixTranslate(off.x, off.y, off.z), MatrixTranslate(-center.x, -center.y, -center.z));
     rlDisableBackfaceCulling();
     // draw the face brighter by blending its base color toward white (+80 per channel)
     Color base = model.colors[model.distFace];
@@ -1345,16 +1359,16 @@ static void drawDistFaceHighlight(const CadModel& model)
 
 // returns the average position of all front-face vertices in draw space (with centering already applied)
 // used to anchor axis/normal arrows at the visual center of the face
-static Vector3 computeFaceCentroid(const TessellatedFace& face, Vector3 center)
+static Vector3 computeFaceCentroid(const TessellatedFace& face, Vector3 center, Vector3 offset = { 0.0f, 0.0f, 0.0f })
 {
     // front vertices occupy the first half of the flat array (second half is the back-face duplicates)
     int frontVertexCount = (int)face.vertices.size() / 6;
     Vector3 sum = { 0, 0, 0 };
     for (int i = 0; i < frontVertexCount; i++) {
         int base = i * 3;
-        sum.x += face.vertices[base] - center.x;
-        sum.y += face.vertices[base + 1] - center.y;
-        sum.z += face.vertices[base + 2] - center.z;
+        sum.x += face.vertices[base] - center.x + offset.x;
+        sum.y += face.vertices[base + 1] - center.y + offset.y;
+        sum.z += face.vertices[base + 2] - center.z + offset.z;
     }
     if (frontVertexCount > 0) {
         float inv = 1.0f / (float)frontVertexCount;
@@ -1366,15 +1380,15 @@ static Vector3 computeFaceCentroid(const TessellatedFace& face, Vector3 center)
 }
 
 // computes the axis-aligned bounding box of the face in draw space (with centering applied)
-static BoundingBox computeFaceBBox(const TessellatedFace& face, Vector3 center)
+static BoundingBox computeFaceBBox(const TessellatedFace& face, Vector3 center, Vector3 offset = { 0.0f, 0.0f, 0.0f })
 {
     BoundingBox bbox = { { 1e18f, 1e18f, 1e18f }, { -1e18f, -1e18f, -1e18f } };
     int frontVertexCount = (int)face.vertices.size() / 6;
     for (int i = 0; i < frontVertexCount; i++) {
         int base = i * 3;
-        float x = face.vertices[base] - center.x;
-        float y = face.vertices[base + 1] - center.y;
-        float z = face.vertices[base + 2] - center.z;
+        float x = face.vertices[base] - center.x + offset.x;
+        float y = face.vertices[base + 1] - center.y + offset.y;
+        float z = face.vertices[base + 2] - center.z + offset.z;
         bbox.min.x = std::min(bbox.min.x, x);
         bbox.max.x = std::max(bbox.max.x, x);
         bbox.min.y = std::min(bbox.min.y, y);
@@ -1387,7 +1401,8 @@ static BoundingBox computeFaceBBox(const TessellatedFace& face, Vector3 center)
 
 // brute-force O(n*m) minimum vertex-to-vertex distance between two faces, approximates the true surface-to-surface distance,
 // accurate enough for CAD face vertex densities (hundreds at most per face), adjacent faces sharing an edge will return 0 (shared vertex)
-static float computeFaceMinDistance(const TessellatedFace& faceA, const TessellatedFace& faceB)
+static float computeFaceMinDistance(
+    const TessellatedFace& faceA, const TessellatedFace& faceB, Vector3 offsetA = { 0.0f, 0.0f, 0.0f }, Vector3 offsetB = { 0.0f, 0.0f, 0.0f })
 {
     float minDistSq = 1e18f;
     int countA = (int)faceA.vertices.size() / 6; // front vertices only
@@ -1396,9 +1411,9 @@ static float computeFaceMinDistance(const TessellatedFace& faceA, const Tessella
         int baseA = i * 3;
         for (int j = 0; j < countB; j++) {
             int baseB = j * 3;
-            float dx = faceA.vertices[baseA] - faceB.vertices[baseB];
-            float dy = faceA.vertices[baseA + 1] - faceB.vertices[baseB + 1];
-            float dz = faceA.vertices[baseA + 2] - faceB.vertices[baseB + 2];
+            float dx = (faceA.vertices[baseA] + offsetA.x) - (faceB.vertices[baseB] + offsetB.x);
+            float dy = (faceA.vertices[baseA + 1] + offsetA.y) - (faceB.vertices[baseB + 1] + offsetB.y);
+            float dz = (faceA.vertices[baseA + 2] + offsetA.z) - (faceB.vertices[baseB + 2] + offsetB.z);
             float dSq = dx * dx + dy * dy + dz * dz;
             if (dSq < minDistSq)
                 minDistSq = dSq;
@@ -1408,12 +1423,29 @@ static float computeFaceMinDistance(const TessellatedFace& faceA, const Tessella
 }
 
 // draws the whole model bounding box (centered at origin to match drawCadModel) in gold
+// recomputed each call to reflect any per-face offsets accumulated since load
 static void drawModelBbox(const CadModel& model)
 {
     Vector3 center = modelCenter(model);
-    BoundingBox centeredBbox = { { model.bbox.min.x - center.x, model.bbox.min.y - center.y, model.bbox.min.z - center.z },
-        { model.bbox.max.x - center.x, model.bbox.max.y - center.y, model.bbox.max.z - center.z } };
-    DrawBoundingBox(centeredBbox, GOLD);
+    BoundingBox dynamicBbox = { { 1e18f, 1e18f, 1e18f }, { -1e18f, -1e18f, -1e18f } };
+    for (int fi = 0; fi < (int)model.pickData.size(); fi++) {
+        const auto& face = model.pickData[fi];
+        Vector3 off = model.faceOffsets[fi];
+        int frontVertexCount = (int)face.vertices.size() / 6;
+        for (int i = 0; i < frontVertexCount; i++) {
+            int base = i * 3;
+            float x = face.vertices[base] - center.x + off.x;
+            float y = face.vertices[base + 1] - center.y + off.y;
+            float z = face.vertices[base + 2] - center.z + off.z;
+            dynamicBbox.min.x = std::min(dynamicBbox.min.x, x);
+            dynamicBbox.max.x = std::max(dynamicBbox.max.x, x);
+            dynamicBbox.min.y = std::min(dynamicBbox.min.y, y);
+            dynamicBbox.max.y = std::max(dynamicBbox.max.y, y);
+            dynamicBbox.min.z = std::min(dynamicBbox.min.z, z);
+            dynamicBbox.max.z = std::max(dynamicBbox.max.z, z);
+        }
+    }
+    DrawBoundingBox(dynamicBbox, GOLD);
 }
 
 // draws the bounding box of the selected face in orange, for planes this will be a near-flat rectangle, for cylinders/tori a proper 3D box
@@ -1422,7 +1454,7 @@ static void drawFaceBbox(const CadModel& model)
     if (model.selectedFace < 0 || model.selectedFace >= (int)model.pickData.size())
         return;
     Vector3 center = modelCenter(model);
-    DrawBoundingBox(computeFaceBBox(model.pickData[model.selectedFace], center), ORANGE);
+    DrawBoundingBox(computeFaceBBox(model.pickData[model.selectedFace], center, model.faceOffsets[model.selectedFace]), ORANGE);
 }
 
 // draws small yellow outward normal arrows per triangle of the selected face (front-face triangles only, strided to avoid clutter)
@@ -1432,6 +1464,7 @@ static void drawFaceNormals(const CadModel& model, float normalLength)
     if (model.selectedFace < 0 || model.selectedFace >= (int)model.pickData.size())
         return;
     Vector3 center = modelCenter(model);
+    Vector3 off = model.faceOffsets[model.selectedFace];
     const auto& faceData = model.pickData[model.selectedFace];
     // tessGrid emits front vertices first then back vertices (same count), so front indices are all < frontVertexCount
     // we only draw normals for front-face triangles to avoid double arrows pointing in opposite directions
@@ -1441,10 +1474,10 @@ static void drawFaceNormals(const CadModel& model, float normalLength)
         if (faceData.indices[i] >= frontVertexCount || faceData.indices[i + 1] >= frontVertexCount || faceData.indices[i + 2] >= frontVertexCount)
             continue;
         int i0 = faceData.indices[i] * 3, i1 = faceData.indices[i + 1] * 3, i2 = faceData.indices[i + 2] * 3;
-        // triangle centroid in draw space (apply same centering as drawCadModel)
-        Vector3 triCenter = { (faceData.vertices[i0] + faceData.vertices[i1] + faceData.vertices[i2]) / 3.0f - center.x,
-            (faceData.vertices[i0 + 1] + faceData.vertices[i1 + 1] + faceData.vertices[i2 + 1]) / 3.0f - center.y,
-            (faceData.vertices[i0 + 2] + faceData.vertices[i1 + 2] + faceData.vertices[i2 + 2]) / 3.0f - center.z };
+        // triangle centroid in draw space (apply same centering as drawCadModel, plus the face's offset)
+        Vector3 triCenter = { (faceData.vertices[i0] + faceData.vertices[i1] + faceData.vertices[i2]) / 3.0f - center.x + off.x,
+            (faceData.vertices[i0 + 1] + faceData.vertices[i1 + 1] + faceData.vertices[i2 + 1]) / 3.0f - center.y + off.y,
+            (faceData.vertices[i0 + 2] + faceData.vertices[i1 + 2] + faceData.vertices[i2 + 2]) / 3.0f - center.z + off.z };
         // average normal of the three vertices (analytical normals so all three are essentially identical, average is just for correctness)
         Vector3 triNormal = { (faceData.normals[i0] + faceData.normals[i1] + faceData.normals[i2]) / 3.0f,
             (faceData.normals[i0 + 1] + faceData.normals[i1 + 1] + faceData.normals[i2 + 1]) / 3.0f,
@@ -1462,12 +1495,13 @@ static void drawFaceAnalyticalAxis(const CadModel& model, float scale)
     if (model.selectedFace < 0 || model.selectedFace >= (int)model.faceSurfaces.size())
         return;
     Vector3 center = modelCenter(model);
+    Vector3 off = model.faceOffsets[model.selectedFace];
     const Surface& surface = model.faceSurfaces[model.selectedFace];
 
     switch (surface.kind) {
     case SurfaceKind::Plane: {
         // one big normal arrow from the face centroid along zDir
-        Vector3 faceCentroid = computeFaceCentroid(model.pickData[model.selectedFace], center);
+        Vector3 faceCentroid = computeFaceCentroid(model.pickData[model.selectedFace], center, off);
         Vec3 normal = surface.axis.zDir.norm();
         Vector3 tip = { faceCentroid.x + (float)normal.x * scale, faceCentroid.y + (float)normal.y * scale, faceCentroid.z + (float)normal.z * scale };
         DrawLine3D(faceCentroid, tip, SKYBLUE);
@@ -1476,7 +1510,9 @@ static void drawFaceAnalyticalAxis(const CadModel& model, float scale)
     case SurfaceKind::Cylinder:
     case SurfaceKind::Torus: {
         // axis line extending in both directions from the surface origin (which is a point on the axis)
-        Vector3 axisOrigin = { (float)surface.axis.origin.x - center.x, (float)surface.axis.origin.y - center.y, (float)surface.axis.origin.z - center.z };
+        // surface origin is in STEP space, apply centering then offset to get draw space
+        Vector3 axisOrigin = { (float)surface.axis.origin.x - center.x + off.x, (float)surface.axis.origin.y - center.y + off.y,
+            (float)surface.axis.origin.z - center.z + off.z };
         Vec3 axisDir = surface.axis.zDir.norm();
         Vector3 axisStart = { axisOrigin.x - (float)axisDir.x * scale, axisOrigin.y - (float)axisDir.y * scale, axisOrigin.z - (float)axisDir.z * scale };
         Vector3 axisEnd = { axisOrigin.x + (float)axisDir.x * scale, axisOrigin.y + (float)axisDir.y * scale, axisOrigin.z + (float)axisDir.z * scale };
@@ -1488,7 +1524,31 @@ static void drawFaceAnalyticalAxis(const CadModel& model, float scale)
     }
 }
 
-// draws the area-weighted average orientation of all faces as a SKYBLUE arrow from the model center (draw-space origin)
+// computes live model bbox across all faces including their current offsets, in STEP space (not draw space)
+static BoundingBox computeLiveModelBBox(const CadModel& model)
+{
+    BoundingBox bbox = { { 1e18f, 1e18f, 1e18f }, { -1e18f, -1e18f, -1e18f } };
+    for (int fi = 0; fi < (int)model.pickData.size(); fi++) {
+        const auto& face = model.pickData[fi];
+        Vector3 off = model.faceOffsets[fi];
+        int frontVertexCount = (int)face.vertices.size() / 6;
+        for (int i = 0; i < frontVertexCount; i++) {
+            int base = i * 3;
+            float x = face.vertices[base] + off.x;
+            float y = face.vertices[base + 1] + off.y;
+            float z = face.vertices[base + 2] + off.z;
+            bbox.min.x = std::min(bbox.min.x, x);
+            bbox.max.x = std::max(bbox.max.x, x);
+            bbox.min.y = std::min(bbox.min.y, y);
+            bbox.max.y = std::max(bbox.max.y, y);
+            bbox.min.z = std::min(bbox.min.z, z);
+            bbox.max.z = std::max(bbox.max.z, z);
+        }
+    }
+    return bbox;
+}
+
+// draws the area-weighted average orientation of all faces as a SKYBLUE arrow from the live model center
 // each face contributes its zDir (plane normal / cylinder+torus axis) weighted by its tessellated area
 static void drawModelAverageNormal(const CadModel& model, float scale)
 {
@@ -1499,13 +1559,174 @@ static void drawModelAverageNormal(const CadModel& model, float scale)
         weightedSum = weightedSum + faceAxis * weight;
     }
     Vec3 avgNormal = weightedSum.norm();
-    // model is drawn centered at origin, so the center of the model in draw space is always (0,0,0)
-    Vector3 origin3D = { 0, 0, 0 };
-    Vector3 tip = { (float)avgNormal.x * scale, (float)avgNormal.y * scale, (float)avgNormal.z * scale };
+    // anchor at the live bbox center in draw space (live center minus the static centering offset)
+    // as faces are push/pulled the live center drifts, keeping the arrow visually attached to the actual model centroid
+    BoundingBox liveBbox = computeLiveModelBBox(model);
+    Vector3 staticCenter = modelCenter(model);
+    Vector3 origin3D = { (liveBbox.min.x + liveBbox.max.x) * 0.5f - staticCenter.x, (liveBbox.min.y + liveBbox.max.y) * 0.5f - staticCenter.y,
+        (liveBbox.min.z + liveBbox.max.z) * 0.5f - staticCenter.z };
+    Vector3 tip = { origin3D.x + (float)avgNormal.x * scale, origin3D.y + (float)avgNormal.y * scale, origin3D.z + (float)avgNormal.z * scale };
     DrawLine3D(origin3D, tip, SKYBLUE);
 }
 
 #pragma region main
+static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float& pitch, float& orbitRadius, bool& showNormals, bool& showBbox, float diagonal)
+{
+    // left mouse drag -> orbit
+    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+        Vector2 mouseDelta = GetMouseDelta();
+        yaw += mouseDelta.x * 0.4f; // 0.4 deg/pixel feel-tuned for typical screen DPI
+        pitch -= mouseDelta.y * 0.4f; // subtract because screen Y is flipped relative to world Y
+        // clamp with 1 degree margin off 90° so that view matrix doesn't degenerate if we go directly above/below target
+        if (pitch > 89.0f)
+            pitch = 89.0f;
+        if (pitch < -89.0f)
+            pitch = -89.0f;
+    }
+    // scroll wheel -> zoom
+    float scrollDelta = GetMouseWheelMove();
+    orbitRadius -= scrollDelta * diagonal * 0.1f; // 10% of diagonal per scroll tick
+    if (orbitRadius < diagonal * 0.1f)
+        orbitRadius = diagonal * 0.1f;
+    if (orbitRadius > diagonal * 10.f)
+        orbitRadius = diagonal * 10.f;
+
+    if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+        int hitFace = pickFace(model, GetMouseRay(GetMousePosition(), camera));
+        if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) {
+            if (model.selectedFace > -1)
+                model.distFace = (hitFace > -1 && hitFace != model.selectedFace) ? hitFace : -1;
+        } else {
+            model.selectedFace = hitFace;
+            model.distFace = -1;
+        }
+    }
+
+    if (IsKeyPressed(KEY_N))
+        showNormals = !showNormals;
+    if (IsKeyPressed(KEY_B))
+        showBbox = !showBbox;
+
+    // push/pull: move selected face along its surface's own axes
+    // UP/DOWN = zDir (normal for planes, axis for cylinders/tori), LEFT/RIGHT = xDir (in-plane tangent), PgUp/PgDn = yDir (zDir×xDir)
+    // step size = 0.5% of model diagonal per frame, Shift multiplies by 10
+    if (model.selectedFace > -1) {
+        float step = diagonal * 0.005f;
+        if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT))
+            step *= 10.0f;
+        const Surface& surf = model.faceSurfaces[model.selectedFace];
+        Vec3 zDir = surf.axis.zDir.norm();
+        Vec3 xDir = surf.axis.xDir.norm();
+        Vec3 yDir = zDir.cross(xDir).norm();
+        Vector3& off = model.faceOffsets[model.selectedFace];
+        if (IsKeyDown(KEY_UP)) {
+            off.x += (float)zDir.x * step;
+            off.y += (float)zDir.y * step;
+            off.z += (float)zDir.z * step;
+        }
+        if (IsKeyDown(KEY_DOWN)) {
+            off.x -= (float)zDir.x * step;
+            off.y -= (float)zDir.y * step;
+            off.z -= (float)zDir.z * step;
+        }
+        if (IsKeyDown(KEY_RIGHT)) {
+            off.x += (float)xDir.x * step;
+            off.y += (float)xDir.y * step;
+            off.z += (float)xDir.z * step;
+        }
+        if (IsKeyDown(KEY_LEFT)) {
+            off.x -= (float)xDir.x * step;
+            off.y -= (float)xDir.y * step;
+            off.z -= (float)xDir.z * step;
+        }
+        if (IsKeyDown(KEY_PAGE_UP)) {
+            off.x += (float)yDir.x * step;
+            off.y += (float)yDir.y * step;
+            off.z += (float)yDir.z * step;
+        }
+        if (IsKeyDown(KEY_PAGE_DOWN)) {
+            off.x -= (float)yDir.x * step;
+            off.y -= (float)yDir.y * step;
+            off.z -= (float)yDir.z * step;
+        }
+    }
+
+    // convert spherical (yaw, pitch, orbitRadius) to Cartesian camera position (x y z)
+    // ex: yaw=90deg, pitch=0 -> camera sits on the +X axis looking toward origin
+    float yawRadians = DEG2RAD * yaw, pitchRadians = DEG2RAD * pitch;
+    camera.position = { orbitRadius * std::cos(pitchRadians) * std::sin(yawRadians), orbitRadius * std::sin(pitchRadians),
+        orbitRadius * std::cos(pitchRadians) * std::cos(yawRadians) };
+}
+
+static void drawUI(const CadModel& model)
+{
+    // stats panel - running Y so adding lines never requires renumbering
+    int uiY = 20;
+    const int uiStep = 20;
+    DrawText("RED = Cylinders", 20, uiY, 16, RED);
+    uiY += uiStep;
+    DrawText("GREEN = Tori (fillets)", 20, uiY, 16, GREEN);
+    uiY += uiStep;
+    DrawText("BLUE = Planes", 20, uiY, 16, BLUE);
+    uiY += uiStep;
+    DrawText("DARKGRAY = Other", 20, uiY, 16, DARKGRAY);
+    uiY += uiStep + 6;
+
+    DrawText(TextFormat("Faces: %d | Triangles: %d", (int)model.meshes.size(), model.totalTriangleCount), 20, uiY, 16, LIGHTGRAY);
+    uiY += uiStep;
+
+    // model bbox dimensions and center recomputed each frame to reflect per-face offsets
+    BoundingBox liveBbox = computeLiveModelBBox(model);
+    Vector3 mCenter = modelCenter(model);
+    DrawText(TextFormat("Width: %.2f | Height: %.2f | Depth: %.2f mm", liveBbox.max.x - liveBbox.min.x, liveBbox.max.y - liveBbox.min.y,
+                 liveBbox.max.z - liveBbox.min.z),
+        20, uiY, 16, LIGHTGRAY);
+    uiY += uiStep;
+    DrawText(TextFormat("Position: %.2f %.2f %.2f", (liveBbox.min.x + liveBbox.max.x) * 0.5f - mCenter.x, (liveBbox.min.y + liveBbox.max.y) * 0.5f - mCenter.y,
+                 (liveBbox.min.z + liveBbox.max.z) * 0.5f - mCenter.z),
+        20, uiY, 16, LIGHTGRAY);
+    uiY += uiStep + 4;
+
+    DrawText("Drag = orbit | Scroll = zoom", 20, uiY, 16, LIGHTGRAY);
+    uiY += uiStep;
+    DrawText("RClick = select | Shift+RClick = get distance", 20, uiY, 16, LIGHTGRAY);
+    uiY += uiStep;
+    DrawText("N = normals | B = bounding box", 20, uiY, 16, LIGHTGRAY);
+    uiY += uiStep;
+    DrawText("Arrows/page keys = translate face (Shift = faster)", 20, uiY, 16, LIGHTGRAY);
+    uiY += uiStep;
+
+    if (model.selectedFace < 0)
+        return;
+
+    uiY += 6;
+    int faceIdx = model.selectedFace;
+    int frontTris = (int)model.pickData[faceIdx].indices.size() / 6;
+    DrawText(
+        TextFormat("Face #%d [%s] | %d triangles | %.2f mm^2", faceIdx, surfaceKindName(model.pickData[faceIdx].kind), frontTris, model.faceAreas[faceIdx]), 20,
+        uiY, 16, YELLOW);
+    uiY += uiStep;
+
+    // face bbox dimensions and center (in draw space = relative to model center = world coords when model at origin)
+    // offset applied so stats match the visual position of the face after push/pull
+    Vector3 center = modelCenter(model);
+    BoundingBox faceBbox = computeFaceBBox(model.pickData[faceIdx], center, model.faceOffsets[faceIdx]);
+    DrawText(TextFormat("Width: %.2f | Height: %.2f | Depth: %.2f mm", faceBbox.max.x - faceBbox.min.x, faceBbox.max.y - faceBbox.min.y,
+                 faceBbox.max.z - faceBbox.min.z),
+        20, uiY, 16, YELLOW);
+    uiY += uiStep;
+    DrawText(TextFormat("Position: %.2f, %.2f, %.2f", (faceBbox.min.x + faceBbox.max.x) * 0.5f, (faceBbox.min.y + faceBbox.max.y) * 0.5f,
+                 (faceBbox.min.z + faceBbox.max.z) * 0.5f),
+        20, uiY, 16, YELLOW);
+    uiY += uiStep;
+
+    if (model.distFace > -1) {
+        float dist = computeFaceMinDistance(
+            model.pickData[model.selectedFace], model.pickData[model.distFace], model.faceOffsets[model.selectedFace], model.faceOffsets[model.distFace]);
+        DrawText(TextFormat("Distance to #%d: %.4f mm", model.distFace, dist), 20, uiY, 16, ORANGE);
+    }
+}
+
 int main()
 {
     InitWindow(1280, 720, "CAD");
@@ -1530,56 +1751,10 @@ int main()
     camera.fovy = 45;
     camera.projection = CAMERA_PERSPECTIVE;
 
-    bool showNormals = false;
-    bool showBbox = false;
-
-    Vector3 modelBboxCenter = modelCenter(model);
-    float modelW = model.bbox.max.x - model.bbox.min.x;
-    float modelH = model.bbox.max.y - model.bbox.min.y;
-    float modelD = model.bbox.max.z - model.bbox.min.z;
+    bool showNormals = false, showBbox = false;
 
     while (!WindowShouldClose()) {
-        // left mouse drag -> orbit
-        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-            Vector2 mouseDelta = GetMouseDelta();
-            yaw += mouseDelta.x * 0.4f; // 0.4 deg/pixel feel-tuned for typical screen DPI
-            pitch -= mouseDelta.y * 0.4f; // subtract because screen Y is flipped relative to world Y
-            // clamp with 1 degree margin off 90° so that view matrix doesn't degerate if we go directly above/below target
-            if (pitch > 89.0f)
-                pitch = 89.0f;
-            if (pitch < -89.0f)
-                pitch = -89.0f;
-        }
-        // scroll wheel -> zoom
-        float scrollDelta = GetMouseWheelMove();
-        orbitRadius -= scrollDelta * diagonal * 0.1f; // 10% of diagonal per scroll tick
-        if (orbitRadius < diagonal * 0.1f)
-            orbitRadius = diagonal * 0.1f;
-        if (orbitRadius > diagonal * 10.f)
-            orbitRadius = diagonal * 10.f;
-
-        if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
-            int hitFace = pickFace(model, GetMouseRay(GetMousePosition(), camera));
-            if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) {
-                if (model.selectedFace > -1)
-                    model.distFace = (hitFace > -1 && hitFace != model.selectedFace) ? hitFace : -1;
-            } else {
-                model.selectedFace = hitFace;
-                model.distFace = -1;
-            }
-        }
-
-        if (IsKeyPressed(KEY_N))
-            showNormals = !showNormals;
-        if (IsKeyPressed(KEY_B))
-            showBbox = !showBbox;
-
-        // convert spherical (yaw, pitch, orbitRadius) to Cartesian camera position (x y z)
-        // ex: yaw=90deg, pitch=0 -> camera sits on the +X axis looking toward origin
-        float yawRadians = DEG2RAD * yaw;
-        float pitchRadians = DEG2RAD * pitch;
-        camera.position = { orbitRadius * std::cos(pitchRadians) * std::sin(yawRadians), orbitRadius * std::sin(pitchRadians),
-            orbitRadius * std::cos(pitchRadians) * std::cos(yawRadians) };
+        handleControls(model, camera, yaw, pitch, orbitRadius, showNormals, showBbox, diagonal);
 
         BeginDrawing();
         ClearBackground({ 18, 18, 22, 255 });
@@ -1596,70 +1771,14 @@ int main()
         }
         if (showNormals) {
             if (model.selectedFace > -1) {
-                drawFaceNormals(model, diagonal * 0.03f); // small yellow arrows per triangle
-                drawFaceAnalyticalAxis(model, diagonal * 0.15f); // big SKYBLUE axis/normal of the surface
+                drawFaceNormals(model, diagonal * 0.03f);
+                drawFaceAnalyticalAxis(model, diagonal * 0.15f);
             } else {
-                drawModelAverageNormal(model, diagonal * 0.3f); // SKYBLUE arrow for dominant model orientation
+                drawModelAverageNormal(model, diagonal * 0.3f);
             }
         }
         EndMode3D();
-
-        // stats panel - running Y so adding lines never requires renumbering
-        int uiY = 20;
-        const int uiStep = 20;
-        DrawText("RED = Cylinders", 20, uiY, 16, RED);
-        uiY += uiStep;
-        DrawText("GREEN = Tori (fillets)", 20, uiY, 16, GREEN);
-        uiY += uiStep;
-        DrawText("BLUE = Planes", 20, uiY, 16, BLUE);
-        uiY += uiStep;
-        DrawText("DARKGRAY = Other", 20, uiY, 16, DARKGRAY);
-        uiY += uiStep + 6;
-
-        DrawText(TextFormat("Faces: %d | Triangles: %d", (int)model.meshes.size(), model.totalTriangleCount), 20, uiY, 16, LIGHTGRAY);
-        uiY += uiStep;
-        // model bbox dimensions and center in STEP space (center is where the model sits before the centering transform)
-        DrawText(TextFormat("Width: %.2f | Height: %.2f | Depth: %.2f mm", modelW, modelH, modelD), 20, uiY, 16, LIGHTGRAY);
-        uiY += uiStep;
-        DrawText(TextFormat("Position: 0.00 0.00 0.00"), 20, uiY, 16, LIGHTGRAY);
-        uiY += uiStep + 4;
-
-        DrawText("Drag = orbit | Scroll = zoom", 20, uiY, 16, LIGHTGRAY);
-        uiY += uiStep;
-        DrawText("RClick = select | Shift+RClick = get distance", 20, uiY, 16, LIGHTGRAY);
-        uiY += uiStep;
-        DrawText("N = normals | B = bounding box", 20, uiY, 16, LIGHTGRAY);
-        uiY += uiStep;
-
-        if (model.selectedFace > -1) {
-            uiY += 6;
-            int faceIdx = model.selectedFace;
-            int frontTris = (int)model.pickData[faceIdx].indices.size() / 6;
-            DrawText(TextFormat("Face #%d [%s] | %d triangles | %.2f mm^2", faceIdx, surfaceKindName(model.pickData[faceIdx].kind), frontTris,
-                         model.faceAreas[faceIdx]),
-                20, uiY, 16, YELLOW);
-            uiY += uiStep;
-
-            // face bbox dimensions and center (in draw space = relative to model center = world coords when model at origin)
-            Vector3 center = modelCenter(model);
-            BoundingBox faceBbox = computeFaceBBox(model.pickData[faceIdx], center);
-            float fw = faceBbox.max.x - faceBbox.min.x;
-            float fh = faceBbox.max.y - faceBbox.min.y;
-            float fd = faceBbox.max.z - faceBbox.min.z;
-            float fcx = (faceBbox.min.x + faceBbox.max.x) * 0.5f;
-            float fcy = (faceBbox.min.y + faceBbox.max.y) * 0.5f;
-            float fcz = (faceBbox.min.z + faceBbox.max.z) * 0.5f;
-            DrawText(TextFormat("Width: %.2f | Height: %.2f | Depth: %.2f mm", fw, fh, fd), 20, uiY, 16, YELLOW);
-            uiY += uiStep;
-            DrawText(TextFormat("Position: %.2f, %.2f, %.2f", fcx, fcy, fcz), 20, uiY, 16, YELLOW);
-            uiY += uiStep;
-
-            if (model.distFace > -1) {
-                float dist = computeFaceMinDistance(model.pickData[model.selectedFace], model.pickData[model.distFace]);
-                DrawText(TextFormat("Distance to #%d: %.4f mm", model.distFace, dist), 20, uiY, 16, ORANGE);
-            }
-        }
-
+        drawUI(model);
         EndDrawing();
     }
     CloseWindow();
