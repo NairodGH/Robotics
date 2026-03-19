@@ -43,7 +43,7 @@ struct Blip {
 // passive sonar does not emit any ping it just listens, bins carry no range only bearing but it's stealthier because you don't reveal your position
 struct PassiveBin {
     float alpha = 0.f;
-    Color color = BLACK;
+    Color color;
 };
 
 // hold everything dynamic

@@ -1694,9 +1694,12 @@ static std::vector<CylinderHealEntry> buildCylinderHealCache(const CadModel& mod
         if (!facesShareVertex(model.pickData[planeFaceIdx], planeOff, model.pickData[ci], model.faceOffsets[ci]))
             continue;
 
-        // determine cap by projecting raw plane centroid onto the cylinder axis, compare to height midpoint
+        // determine cap by projecting the plane centroid (raw STEP position + current draw-space offset) onto the
+        // cylinder axis, then comparing to the height midpoint, the offset must be included because a prior heal
+        // may have extended heightMax, shifting the midpoint so that the raw centroid alone would pick the wrong cap
         Vec3 toCent = { planeCent.x - cylSurf.axis.origin.x, planeCent.y - cylSurf.axis.origin.y, planeCent.z - cylSurf.axis.origin.z };
-        double planeProjH = toCent.dot(cylAxis);
+        double planeOffDot = planeOff.x * cylAxis.x + planeOff.y * cylAxis.y + planeOff.z * cylAxis.z;
+        double planeProjH = toCent.dot(cylAxis) + planeOffDot;
         const CylinderHeightRange& chr = model.cylHeightRanges[ci];
         bool isMaxCap = (planeProjH >= (chr.heightMin + chr.heightMax) * 0.5);
 
@@ -1791,12 +1794,11 @@ static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float&
         if (translating && !wasTranslating) {
             model.undoStack.push_back({ model.selectedFace, off });
             model.redoStack.clear();
-            // build the heal cache once at the start of each gesture while the plane is still touching the cylinder
-            // subsequent frames reuse it so no proximity scan happens during translation
-            if (cachedHealFace != model.selectedFace) {
-                healCache = buildCylinderHealCache(model, model.selectedFace);
-                cachedHealFace = model.selectedFace;
-            }
+            // always rebuild at every gesture rising edge so connectivity is re-evaluated at the plane's current
+            // position, a stale cache from a prior gesture must never carry over because the plane may have
+            // been moved off-axis (disconnected from the cylinder) between gestures
+            healCache = buildCylinderHealCache(model, model.selectedFace);
+            cachedHealFace = model.selectedFace;
         }
         // invalidate cache if the selected face changed between gestures
         if (cachedHealFace != model.selectedFace) {
