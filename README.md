@@ -1,6 +1,7 @@
 # <p align="center">💻 Simulations 🧊</p>
 
 This project started off a weekend technical test I was asked by a company as part of their recruiting process (removed any elements I thought could lead people to cheat using it).\
+The code intentionally has a high amount of comments (with analogies and examples for hard concepts) as this was made for educational purposes.\
 Since I used [raylib](https://www.raylib.com/) and [eigen](https://gitlab.com/libeigen/eigen) for visualization, which are solid C++ choices for other projects I had in mind, I decided to continue from their existing setup:
 - download [CMake 4.0+](https://cmake.org/download/)
 - then either
@@ -26,11 +27,7 @@ Available targets:
     </a>
 </p>
 
-[3D printer](https://en.wikipedia.org/wiki/3D_printing) ramp generation.
-
-Click on the "Linear" toggle to switch back and forth between it and the "Spiral" kind.\
-Drag the sliders to change their respective values.\
-Drag on the scene to pan around X.
+[3D printing](https://en.wikipedia.org/wiki/3D_printing) base generation (for a shape/position that couldn't be printed if not for it).
 
 # <p align="center">🦾 Kinematic 🏁</p>
 
@@ -40,11 +37,8 @@ Drag on the scene to pan around X.
     </a>
 </p>
 
-[Kinematic chain](https://en.wikipedia.org/wiki/Kinematic_chain) with [serial manipulator](https://en.wikipedia.org/wiki/Serial_manipulator).
-
-Click on the "Axis 0 linear" toggle to switch back and forth between it and the "rotary" kind (not possible on the other axes since it'd break the arm).\
-Drag the sliders to change their respective values.\
-Drag on the scene to pan around and scroll the mouse wheel to zoom/unzoom.
+[Kinematic chain](https://en.wikipedia.org/wiki/Kinematic_chain) of a [serial manipulator](https://en.wikipedia.org/wiki/Serial_manipulator).\
+Only axis 0 (base) can be changed between linear and rotary because linear on any other piece would break the arm.
 
 # <p align="center">🍲 Soup 🦠</p>
 
@@ -64,8 +58,8 @@ Drag on the scene to pan around and scroll the mouse wheel to zoom/unzoom.
     </a>
 </p>
 
-Minimal [STEP](https://en.wikipedia.org/wiki/ISO_10303) file loader (cylinders, planes and tori with their relevant keywords for rendering, everything else (styling, metadata, presentation, assembly) is ignored) and [tessellator](https://en.wikipedia.org/wiki/Tessellation_(computer_graphics)) for [B-rep](https://en.wikipedia.org/wiki/Boundary_representation) to [mesh](https://en.wikipedia.org/wiki/Polygon_mesh) visualization.\
-Drag on the scene to pan around and scroll the mouse wheel to zoom/unzoom.
+Minimal [STEP](https://en.wikipedia.org/wiki/ISO_10303) file loader (cylinders, planes and tori with their relevant keywords for rendering, everything else (styling, metadata, presentation, [assembly](https://en.wikipedia.org/wiki/Assembly_modelling)) is ignored) and [tessellator](https://en.wikipedia.org/wiki/Tessellation_(computer_graphics)) for [B-rep](https://en.wikipedia.org/wiki/Boundary_representation) to [mesh](https://en.wikipedia.org/wiki/Polygon_mesh) visualization.\
+Completed by [face selection](https://en.wikipedia.org/wiki/Ray_casting) for distance between them and translation involving rudimentary plane-cylinder [geometry healing](https://en.wikipedia.org/wiki/Mesh_generation) (no [constraints](https://en.wikipedia.org/wiki/Constraint_(computer-aided_design)), must be aligned), as well as convenient controls and measurements in the UI.
 
 # <p align="center">📟 PPI ᯤ</p>
 
@@ -75,7 +69,5 @@ Drag on the scene to pan around and scroll the mouse wheel to zoom/unzoom.
     </a>
 </p>
 
-Real-time PPI [sonar](https://en.wikipedia.org/wiki/Sonar) display simulating active and passive detection modes, two-way [transmission loss](https://en.wikipedia.org/wiki/Transmission_loss), [thermocline](https://en.wikipedia.org/wiki/Thermocline)-induced shadow zones, and a depth-varying [sound speed profile](https://en.wikipedia.org/wiki/Sound_speed_profile).\
+Real-time PPI [sonar](https://en.wikipedia.org/wiki/Sonar) display simulating active (send then receive, gets range but less stealthy) and passive (only receive, gets only direction but more stealthy) detection modes, two-way [transmission loss](https://en.wikipedia.org/wiki/Transmission_loss), [thermocline](https://en.wikipedia.org/wiki/Thermocline)-induced shadow zones, and a depth-varying [sound speed profile](https://en.wikipedia.org/wiki/Sound_speed_profile).\
 Assumes we're a surface vessel with sonar [transducer](https://en.wikipedia.org/wiki/Transducer) pointing downward towards submarines/whales/etc...\
-Click on the "Active" toggle to switch back and forth between it and the "Passive" mode.\
-Drag the sliders to change their respective values.
