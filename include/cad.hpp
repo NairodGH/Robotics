@@ -71,7 +71,7 @@ struct BoundaryLoop {
 struct TessellatedFace {
     SurfaceKind kind = SurfaceKind::Unknown;
     std::vector<float> vertices; // interleaved XYZ
-    std::vector<float> normals; // interleaved XYZ, exact analytical normals
+    std::vector<float> normals; // interleaved XYZ
     std::vector<int> indices; // triangle indices
 };
 
@@ -80,13 +80,13 @@ struct StepEntity {
 };
 using StepMap = std::unordered_map<int, StepEntity>;
 
-// one entry on the undo/redo stack, which face moved and what its offset was before the move began
+// one entry on the undo/redo stack
 struct UndoEntry {
-    int faceIndex;
-    Vector3 offsetBefore;
+    int faceIndex; // which face moved
+    Vector3 offsetBefore; // what its offset was before the move began
 };
 
-// mutable height extent of a cylinder face along its axis, used for geometry healing when a connected cap plane is translated
+// mutable height extent of a cylinder face along its axis, used for geometry healing when a connected cap plane is translated,
 // stored separately so the healing pass can retessellate the cylinder with the updated range without re-parsing STEP
 // for non-cylinder faces both values are 0 and the struct is never read
 struct CylinderHeightRange {
@@ -100,20 +100,24 @@ struct CylinderHealEntry {
     double axisDotNormal; // dot(cylAxis, planeNormal) = about 1, preserves sign for signedDelta each frame
 };
 
-// final GPU model
+// final GPU model, many are SoA (Struct of Arrays) related index wise for their specific tasks
 struct CadModel {
+    // SoA per mesh
     std::vector<Mesh> meshes;
-    std::vector<Color> colors; // one per mesh (index wise), color-coded by surface type
-    BoundingBox bbox;
+    std::vector<Color> colors;
+    // SoA per face
     std::vector<TessellatedFace> pickData; // CPU copy kept after GPU upload, for mouse ray picking and analysis
     std::vector<Surface> faceSurfaces; // analytical surface definition per face, for axis/normal display
     std::vector<float> faceAreas;
     std::vector<Vector3> faceOffsets; // per-face translation in draw space, applied on top of the centering transform at draw/query time
-    std::vector<CylinderHeightRange> cylHeightRanges; // per-face cylinder axis height range, kept mutable for geometry healing; non-cylinders are zeroed
+    std::vector<CylinderHeightRange> cylHeightRanges; // per-face cylinder axis height range, kept mutable for geometry healing, non-cylinders are zeroed
+    // SoA per translation
+    std::vector<UndoEntry> undoStack; // pushed once on gesture
+    std::vector<UndoEntry> redoStack; // cleared on new translation, populated by undo
+    // measurements
+    BoundingBox bbox;
     int totalTriangleCount = 0;
     int selectedFace = -1;
     int distFace = -1;
-    std::vector<UndoEntry> undoStack; // pushed once per translation gesture (on first IsKeyPressed of a drag)
-    std::vector<UndoEntry> redoStack; // cleared on new translation, populated by undo
     ~CadModel();
 };

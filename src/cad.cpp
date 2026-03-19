@@ -3,9 +3,7 @@
 #pragma region step parser
 // accumulates multi-line entities until ';', extracts #ID = TYPE(params)
 
-// splits a comma-separated parameter string at the top level only
-// (i.e. commas inside nested parentheses are ignored)
-// ex: "A,(B,C),D" -> ["A", "(B,C)", "D"]
+// splits a comma-separated parameter string at the top level only, commas inside nested parentheses are ignored, ex: "A,(B,C),D" -> ["A", "(B,C)", "D"]
 // needed because STEP params can contain nested lists like coordinate tuples
 static std::vector<std::string> splitTopLevel(const std::string& input)
 {
@@ -30,33 +28,28 @@ static std::vector<std::string> splitTopLevel(const std::string& input)
     return result;
 }
 
-// strips leading/trailing whitespace (spaces, tabs, CR, LF) from a string
-// ex: "  #12 \t" -> "#12"
+// strips leading/trailing whitespace (spaces, tabs, CR, LF) from a string, ex: "  #12 \t" -> "#12"
 static std::string trimWS(const std::string& input)
 {
     auto first = input.find_first_not_of(" \t\r\n"), last = input.find_last_not_of(" \t\r\n");
     return first == std::string::npos ? "" : input.substr(first, last - first + 1);
 }
 
-// strips the outermost parentheses from a string
-// ex: "(A,B)" -> "A,B"
-// used to peel the argument list off a STEP entity before splitting it
+// strips the outermost parentheses from a string, used to peel the argument list off a STEP entity before splitting it, ex: "(A,B)" -> "A,B"
 static std::string unwrap(const std::string& input)
 {
     auto open = input.find('('), close = input.rfind(')');
     return (open == std::string::npos || close == std::string::npos) ? input : input.substr(open + 1, close - open - 1);
 }
 
-// parses a STEP entity reference to its numeric ID, returns -1 if not a ref
-// ex: " #123 " -> 123,   "0.5" -> -1
+// parses a STEP entity reference to its numeric ID, returns -1 if not a ref, ex: " #123 " -> 123, "0.5" -> -1
 static int stepRef(const std::string& input)
 {
     auto trimmed = trimWS(input);
     return (!trimmed.empty() && trimmed[0] == '#') ? std::stoi(trimmed.substr(1)) : -1;
 }
 
-// converts a trimmed string token to a double, returns 0 on parse failure
-// ex: " 3.14 " -> 3.14,   ".F." -> 0.0
+// converts a trimmed string token to a double, returns 0 on parse failure, ex: " 3.14 " -> 3.14,   ".F." -> 0.0
 static double dbl(const std::string& input)
 {
     try {
@@ -100,7 +93,7 @@ StepMap parseStepFile(const std::string& path)
                 break;
             trimmedLine.erase(commentStart, (commentEnd == std::string::npos ? trimmedLine.size() : commentEnd + 2) - commentStart);
         }
-        // STEP entities can span multiple lines; accumulate until the terminating ';'
+        // STEP entities can span multiple lines so accumulate until the terminating ';'
         accum += trimmedLine;
         if (!accum.empty() && accum.back() == ';') {
             std::smatch match;
@@ -115,7 +108,7 @@ StepMap parseStepFile(const std::string& path)
 #pragma region step resolver
 // STEP stores everything as a flat list of numbered entities that reference each other by ID, "resolving" means following those references to assemble the
 // actual geometric data, for example a CYLINDRICAL_SURFACE entity just contains a reference to an AXIS2_PLACEMENT_3D and a radius number, resolving it means
-// looking up that placement entity, which in turn references two DIRECTION entities and a CARTESIAN_POINT, each of which you also have to look up
+// looking up that placement entity, which in turn references two DIRECTION entities and a CARTESIAN_POINT, each of which you also have to look up,
 // by the time you are done you have a proper origin, axis direction, and radius you can actually do math with
 Vec3 resolvePoint(int id, const StepMap& map)
 {
@@ -124,7 +117,7 @@ Vec3 resolvePoint(int id, const StepMap& map)
         return {};
     auto params = splitTopLevel(entityIt->second.params);
     // CARTESIAN_POINT params: (name, (x,y,z))
-    // params[0] = name string (e.g. "''"), params[1] = coordinate tuple "(1.0,2.0,3.0)"
+    // params[0] = name string (ex: "''"), params[1] = coordinate tuple "(1.0,2.0,3.0)"
     if (params.size() < 2)
         return {};
     // unwrap "(1.0,2.0,3.0)" -> "1.0,2.0,3.0", then split to ["1.0","2.0","3.0"]
@@ -188,39 +181,6 @@ Surface resolveSurface(int id, const StepMap& map)
     return surface;
 }
 
-// exact outward normal at 'pos' on surface 's'
-Vec3 surfaceNormalAt(const Surface& surface, Vec3 pos)
-{
-    Vec3 Z = surface.axis.zDir.norm(), X = surface.axis.xDir.norm(), origin = surface.axis.origin;
-    switch (surface.kind) {
-    case SurfaceKind::Plane:
-        // plane normal is constant: just the Z axis of the placement
-        // ex: placement with zDir=(0,0,1) -> normal always (0,0,1)
-        return Z;
-    case SurfaceKind::Cylinder: {
-        // project pos onto the cylinder axis to get the closest axial point,
-        // then the outward radial vector from that point to pos is the normal
-        // ex: axis along Z, pos=(5,0,3), origin=(0,0,0) -> axialPt=(0,0,3), normal=(1,0,0)
-        Vec3 delta = pos - origin;
-        return (pos - (origin + Z * delta.dot(Z))).norm();
-    }
-    case SurfaceKind::Torus: {
-        // the torus center circle lies in the XY plane of the placement at radius R
-        // find the angular position of pos projected onto that plane, then locate
-        // the nearest point on the center circle (torusCenter), and the outward normal is pos-torusCenter
-        // ex: R=10, pos=(12,0,1) -> torusCenter=(10,0,0), normal=(0.894,0,0.447)
-        Vec3 Y = Z.cross(X).norm();
-        Vec3 delta = pos - origin;
-        // atan2 gives the angle of pos projected into the torus XY plane
-        Vec3 torusCenter = origin + X * std::cos(std::atan2(delta.dot(Y), delta.dot(X))) * surface.majorRadius
-            + Y * std::sin(std::atan2(delta.dot(Y), delta.dot(X))) * surface.majorRadius;
-        return (pos - torusCenter).norm();
-    }
-    default:
-        return { 0, 0, 1 };
-    }
-}
-
 #pragma region curve
 // sampler: a CIRCLE arc from startPt to endPt (or full revolution if isClosedLoop)
 // sameSense: effective arc direction = EDGE_CURVE same_sense XOR ORIENTED_EDGE edgeReversed
@@ -255,7 +215,7 @@ static std::vector<Vec3> sampleCircle(int id, Vec3 startPt, Vec3 endPt, bool isC
         angleEnd = 2 * M_PI;
     } else if (sameSense) {
         // CCW sweep: enforce angleEnd > angleStart
-        // ex: start=2.9rad, end=-2.9rad (same as +3.38) -> angleEnd becomes -2.9+2pi=3.38
+        // ex: start=2.9rad, end=-2.9rad -> angleEnd becomes -2.9+2pi=3.38
         angleStart = angleOf(startPt);
         angleEnd = angleOf(endPt);
         while (angleEnd <= angleStart)
@@ -271,7 +231,6 @@ static std::vector<Vec3> sampleCircle(int id, Vec3 startPt, Vec3 endPt, bool isC
         angleEnd = angleOf(endPt);
         while (angleEnd >= angleStart)
             angleEnd -= 2 * M_PI;
-        // clamp to at most one full revolution
         if (angleStart - angleEnd > 2 * M_PI + 1e-6)
             angleEnd = angleStart - 2 * M_PI;
     }
@@ -291,8 +250,7 @@ static std::vector<Vec3> sampleCircle(int id, Vec3 startPt, Vec3 endPt, bool isC
 
 // evaluate a B_SPLINE_CURVE_WITH_KNOTS using De Boor's algorithm
 // each round takes the current set of local control points and replaces them with a smaller set of blended points, until one point remains
-// basically what De Casteljau's algorithm is to Bézier curves
-// it is numerically stable and the standard way to evaluate splines
+// basically what De Casteljau's algorithm is to Bézier curves, numerically stable and the standard way to evaluate splines
 static std::vector<Vec3> sampleBSpline(int id, Vec3 startPt, Vec3 endPt, const StepMap& map, int segs = 16)
 {
     auto entityIt = map.find(id);
@@ -328,9 +286,9 @@ static std::vector<Vec3> sampleBSpline(int id, Vec3 startPt, Vec3 endPt, const S
     // ex: degree 3 needs at least 4 control points
     if ((int)controlPoints.size() <= degree)
         return { startPt, endPt };
-    // scan remaining params for the knot vector: first parenthesised list of plain
-    // floats with enough entries (must have n+degree+1 knots for n control points)
-    // ex: 4 ctrl pts, degree 3 -> need 4+3+1=8 knots, e.g. (0,0,0,0,1,1,1,1)
+    // scan remaining params for the knot vector: first parenthesised list of plain floats with enough entries, must have n+degree+1 knots for n control points
+    // go 3 by 3 for coords, tokenize commas, check for no ref but actual convertible doubles (allNumeric false means something wrong)
+    // ex: 4 ctrl pts, degree 3 -> need 4+3+1=8 knots, ex: (0,0,0,0,1,1,1,1)
     std::vector<double> knots;
     for (int i = 3; i < (int)params.size() && knots.empty(); i++) {
         std::string token = trimWS(params[i]);
@@ -361,10 +319,9 @@ static std::vector<Vec3> sampleBSpline(int id, Vec3 startPt, Vec3 endPt, const S
     // ex: knots=(0,0,0,0,1,1,1,1), degree=3 -> tMin=knots[3]=0, tMax=knots[4]=1
     double tMin = knots[degree], tMax = knots[(int)knots.size() - 1 - degree];
 
-    // De Boor's algorithm: evaluate the B-spline at parameter t
-    // finds the knot span k such that knots[k] <= t < knots[k+1],
+    // De Boor's algorithm: evaluate the B-spline at parameter t, finds the knot span k such that knots[k] <= t < knots[k+1]
     // then runs degree rounds of linear interpolation on the local control polygon
-    // ex: degree=3, t=0.5 on [0..1] -> picks the span containing 0.5, blends 4 local ctrl pts down to 1
+    // ex: degree=3, t=0.5 on [0 to 1] -> picks the span containing 0.5, blends 4 local ctrl pts down to 1
     auto deBoor = [&](double t) -> Vec3 {
         // find knot span index (clamped to the last valid span)
         int spanIndex = degree, lastSpan = (int)knots.size() - 2 - degree;
@@ -375,7 +332,7 @@ static std::vector<Vec3> sampleBSpline(int id, Vec3 startPt, Vec3 endPt, const S
             }
             spanIndex = lastSpan;
         }
-        // local control points for this span: controlPoints[spanIndex-degree .. spanIndex]
+        // local control points for this span: controlPoints[spanIndex-degree to spanIndex]
         std::vector<Vec3> localPoints(controlPoints.begin() + spanIndex - degree, controlPoints.begin() + spanIndex + 1);
         // degree rounds of De Boor triangular interpolation:
         // each round replaces degree+1-r points with r-blended values
@@ -456,7 +413,7 @@ static BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs)
 
         int startVertexId = stepRef(edgeCurveParams[1]), endVertexId = stepRef(edgeCurveParams[2]);
         // if start and end vertex entity are the same ref, this edge is a closed circle (full revolution)
-        // ex: "#130 = VERTEX_POINT" for both startVertexId and endVertexId -> full-circle edge (e.g. bolt head rim)
+        // ex: "#130 = VERTEX_POINT" for both startVertexId and endVertexId -> full-circle edge (ex: bolt head rim)
         bool fullCircle = (startVertexId == endVertexId && startVertexId > 0);
         if (fullCircle)
             loop.hasFullCircle = true;
@@ -466,8 +423,7 @@ static BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs)
             auto vertexIt = map.find(vertexId);
             if (vertexIt == map.end() || vertexIt->second.type != "VERTEX_POINT")
                 return {};
-            // VERTEX_POINT params: (name, cartesian_point_ref)
-            // ex: "('', #140)" -> position = point[140]
+            // VERTEX_POINT params: (name, cartesian_point_ref), ex: "('', #140)" -> position = point[140]
             auto vertexParams = splitTopLevel(vertexIt->second.params);
             return (vertexParams.size() >= 2) ? resolvePoint(stepRef(vertexParams[1]), map) : Vec3 {};
         };
@@ -497,8 +453,7 @@ static BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs)
         for (int i = startIndex; i < (int)edgeSamples.size(); i++)
             loop.points.push_back(edgeSamples[i]);
     }
-    // remove closing duplicate: STEP loops are closed, so the last point often
-    // coincides with the first; drop it so the polygon is a proper open ring
+    // remove closing duplicate: STEP loops are closed, so the last point often coincides with the first, drop it so the polygon is a proper open ring
     // ex: [A,B,C,D,A] -> [A,B,C,D]
     if (loop.points.size() > 1 && loop.points.front().near(loop.points.back()))
         loop.points.pop_back();
@@ -507,8 +462,14 @@ static BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs)
 
 #pragma region 2D ear-clip
 // imagine a polygon drawn on paper, an "ear" is any three consecutive vertices where the middle one can be cut off cleanly
-// the triangle formed by those three vertices lies entirely inside the polygon and contains no other vertices,
-// ear-clipping just repeatedly finds one of those ears, emits the triangle, removes the middle vertex, and repeats until only one triangle is left
+// the triangle formed by those three vertices lies entirely inside the polygon and contains no other vertices, ear-clipping just repeatedly
+// - finds one of those ears (3 adjacent points forming a triangle)
+// - emits the triangle
+// - removes the middle vertex
+// - repeats by finding a new triangle using the 2 remaining points and a new adjacent one
+// however you gotta watch out for reflex vertices, in a "convex" polygon (all inner angles under 180° aka the classic ones),
+// a "reflex vertex" describes the specific vertex where a concavity happens, if it's the middle vertex then the triangle we make will be outside of the plane
+// so we skip it and make sure it's never a middle vertex and only clip ears at convex ones
 // it is done in 2D because the faces are flat planes, you project the 3D boundary down to a flat coordinate system (the plane's own UV tangent frame),
 // triangulate there where the math is simple, then lift the result back to 3D
 
@@ -528,10 +489,6 @@ static double area2D(const std::vector<Vec2>& polygon)
 
 // 2D cross product of vectors (b-a) and (c-a)
 // positive = CCW turn at b, negative = CW turn (reflex), zero = collinear
-// in a "convex" polygon (all inner angles under 180° aka the classic ones), a "reflex vertex" describes the specific vertex where a concavity happens
-// the polygon is then "concave", when you have a face with a hole in it merged via a bridge cut, the resulting polygon is concave and
-// will have reflex vertices at the bridge seam points which is precisely why the ear-clipper needs the reflex check,
-// it has to skip those vertices and only clip ears at convex ones
 // ex: a=(0,0), b=(1,0), c=(1,1) -> +1.0 (left turn, convex ear candidate)
 //     a=(0,0), b=(1,0), c=(0,-1) ->  -1.0 (right turn, reflex vertex, not an ear)
 static double cross2D(Vec2 a, Vec2 b, Vec2 c) { return (b.u - a.u) * (c.v - a.v) - (b.v - a.v) * (c.u - a.u); }
@@ -627,8 +584,8 @@ static std::vector<std::array<int, 3>> earClip(const std::vector<Vec2>& polygon)
 
 // when you have a polygon with a hole in it, the ear-clipper can only handle simple polygons (no holes)
 // a bridge cut is a straight line segment that connects a point on the hole boundary to a point on the outer boundary,
-// effectively "unzipping" the hole into the outer polygon, the result looks like a polygon with a very thin corridor cut into it,
 // now it has no hole, just a slightly more complex outline that the ear-clipper can handle normally
+// since it produce degenerate zero-area ears (the two duplicate vertices are collinear), the ear-clipper skips without emitting a triangle for them
 
 // given the current (possibly already-merged) outer polygon and the +X ray origin rayOrigin,
 // returns the index of the polygon vertex that is the best bridge target:
@@ -728,7 +685,7 @@ static std::vector<Vec2> buildMergedPolygon(const std::vector<Vec2>& outer, cons
         int bridgeTargetIndex = findBridgeVertex(merged, bridgeSource);
 
         // splice hole into merged polygon at bridgeTargetIndex:
-        // outer[0..bridgeTargetIndex] -> hole[rightmostIndex..rightmostIndex-1] -> hole[rightmostIndex] (seam) -> outer[bridgeTargetIndex..end]
+        // outer[0 to bridgeTargetIndex] -> hole[rightmostIndex to rightmostIndex-1] -> hole[rightmostIndex] (seam) -> outer[bridgeTargetIndex to end]
         // the duplicated vertices are what create the "bridge cut"
         // ex: outer=[A,B,C,D], bridgeTargetIndex=1 (=B), hole=[H0,H1,H2], rightmostIndex=0
         //  -> [A, B, H0,H1,H2, H0, B, C, D]  (B and H0 each appear twice = the two seam edges)
@@ -783,8 +740,7 @@ static void appendVertex(TessellatedFace& face, Vec3 pos, Vec3 nor)
     face.normals.push_back((float)nor.z);
 }
 
-// appends a single triangle (three vertex indices) to the index list
-// ex: appendTri(face, 0, 1, 2) -> face.indices = [..., 0, 1, 2]
+// appends a single triangle (three vertex indices) to the index list, ex: appendTri(face, 0, 1, 2) -> face.indices = [..., 0, 1, 2]
 static void appendTri(TessellatedFace& face, int a, int b, int c)
 {
     face.indices.push_back(a);
@@ -809,7 +765,7 @@ static TessellatedFace tessGrid(SurfaceKind kind, std::function<Vec3(double u, d
             appendVertex(face, positionFn(u, v), normalFn(u, v));
         }
     // frontVertexCount = total front vertex count; back vertices start at index frontVertexCount
-    // ex: uSteps=3, vSteps=2 -> frontVertexCount=4*3=12; back verts are indices 12..23
+    // ex: uSteps=3, vSteps=2 -> frontVertexCount=4*3=12; back verts are indices 12 to 23
     int frontVertexCount = (uSteps + 1) * (vSteps + 1);
     // back vertices: same positions as front but normals flipped for inside rendering
     for (int vi = 0; vi <= vSteps; vi++)
@@ -886,13 +842,12 @@ static TessellatedFace tessCylinder(const Surface& surface, const std::vector<Bo
     }
 
     // cylinder surface: positionFn(u,v) = origin + radius*(cos(u)*X + sin(u)*Y) + v*Z
-    // u = angle around axis [angleMin..angleMax], v = height along axis [heightMin..heightMax]
+    // u = angle around axis [angleMin to angleMax], v = height along axis [heightMin to heightMax]
     auto positionFn = [&](double u, double v) -> Vec3 {
         Vec3 radialDir = X * std::cos(u) + Y * std::sin(u);
         return origin + radialDir * radius + Z * v;
     };
-    // outward radial direction (same for all v at a given u):
-    // ex: u=0 -> normal=(1,0,0);  u=pi/2 -> normal=(0,1,0)
+    // outward radial direction (same for all v at a given u),  ex: u=0 -> normal=(1,0,0);  u=pi/2 -> normal=(0,1,0)
     auto normalFn = [&](double u, double v) -> Vec3 {
         (void)v;
         return (X * std::cos(u) + Y * std::sin(u));
@@ -907,7 +862,7 @@ static TessellatedFace tessTorus(const Surface& surface, int uSegments, int vSeg
     double majorRadius = surface.majorRadius, minorRadius = surface.minorRadius;
 
     // torus surface: positionFn(u,v) = origin + (majorRadius + minorRadius*cos(v))*(cos(u)*X + sin(u)*Y) + minorRadius*sin(v)*Z
-    // u = angle around the major circle [0..2pi], v = angle around the tube cross-section [0..2pi]
+    // u = angle around the major circle [0 to 2pi], v = angle around the tube cross-section [0 to 2pi]
     // ex: u=0, v=0 -> outermost equator point at origin+(majorRadius+minorRadius)*X
     //     u=0, v=pi ->  innermost equator point at origin+(majorRadius-minorRadius)*X
     auto positionFn = [&](double u, double v) -> Vec3 {
@@ -1122,8 +1077,7 @@ static Color colorForKind(SurfaceKind kind)
     }
 }
 
-// human-readable label for each surface type, used in the stats panel
-static const char* surfaceKindName(SurfaceKind kind)
+static const char* nameForKind(SurfaceKind kind)
 {
     switch (kind) {
     case SurfaceKind::Plane:
@@ -1150,7 +1104,7 @@ static float computeFaceArea(const TessellatedFace& face)
         Vec3 v0 = { face.vertices[i0], face.vertices[i0 + 1], face.vertices[i0 + 2] };
         Vec3 v1 = { face.vertices[i1], face.vertices[i1 + 1], face.vertices[i1 + 2] };
         Vec3 v2 = { face.vertices[i2], face.vertices[i2 + 1], face.vertices[i2 + 2] };
-        area += 0.5f * (float)(v1 - v0).cross(v2 - v0).len();
+        area += 0.5f * (float)(v1 - v0).cross(v2 - v0).len(); // triangle area formula
     }
     return area;
 }
@@ -1223,7 +1177,7 @@ CadModel loadStep(const std::string& path, int arcSegs = 48)
         Mesh mesh = uploadMesh(tessellatedFace);
         if (mesh.vertexCount == 0)
             continue;
-        // all parallel arrays stay in sync, one entry per successfully uploaded face
+        // all parallel SoA arrays stay in sync, one entry per successfully uploaded face
         model.meshes.push_back(mesh);
         model.colors.push_back(colorForKind(tessellatedFace.kind));
         model.pickData.push_back(tessellatedFace);
@@ -1285,10 +1239,14 @@ void drawCadModel(const CadModel& model)
     rlEnableBackfaceCulling();
 }
 
-#pragma region picking
-// Möller–Trumbore ray-triangle intersection: parameterizes the triangle as v0 + u*(v1-v0) + v*(v2-v0),
-// solves for the ray parameter t (distance along the ray to the hit), returns t > 0 or -1 if no intersection
-// ex: ray pointing at a triangle 5 units away -> returns ~5.0, ray parallel or pointing away -> -1
+#pragma region selection
+// Möller–Trumbore ray-triangle intersection, imagine you're in a dark room holding a flashlight, here's a triangular picture frame on the wall
+// somewhere in front of you, you want to know if your flashlight beam hits the framed canvas, and if so how far away it is,
+// you can't just ask "does my beam cross the plane of the wall" since the wall is infinite, you need to know if the beam lands inside the triangle,
+// so you describe any point inside the triangle as "start at corner A, walk a fraction toward B then a fraction toward C"
+// if those two fractions are both positive and don't sum to more than 1, you're inside the triangle, this algo solves for exactly those two fractions
+// and the distance t simultaneously, using the ray direction and the two triangle edges as the axes of a little local coordinate system,
+// if the fractions are in bounds and t is positive (the triangle is in front of you, not behind), your flashlight hits the canvas at distance t
 static float rayTriangleIntersect(Ray ray, Vec3 v0, Vec3 v1, Vec3 v2)
 {
     const float epsilon = 1e-8f;
@@ -1302,6 +1260,10 @@ static float rayTriangleIntersect(Ray ray, Vec3 v0, Vec3 v1, Vec3 v2)
     float invDet = 1.0f / det;
     Vec3 rayOrig = { ray.position.x, ray.position.y, ray.position.z };
     Vec3 s = rayOrig - v0;
+    // instead of describing a point's position as "X units right, Y units up from some origin," barycentric coordinates describe it as
+    // "how much of each corner of a triangle contributes to this point", every point in or near a triangle gets three numbers (u, v, w) that sum to 1,
+    // each number is the "weight" of the corresponding corner (like three magnets each pulling the point toward each other with a certain strength)
+    // ex: centroid is (1/3, 1/3, 1/3), corner A is (1, 0, 0), midpoint of edge AB is (1/2, 1/2, 0), a point outside has at least one negative weight
     // u is the barycentric coordinate along edge1, must be in [0,1] to be inside the triangle
     float u = (float)s.dot(h) * invDet;
     if (u < 0.0f || u > 1.0f)
@@ -1361,35 +1323,40 @@ static void drawSelectedFaceHighlight(const CadModel& model)
     Vector3 off = model.faceOffsets[model.selectedFace];
     Matrix centeredTransform = MatrixMultiply(MatrixTranslate(off.x, off.y, off.z), MatrixTranslate(-center.x, -center.y, -center.z));
     rlDisableBackfaceCulling();
-    Material solidMaterial = LoadMaterialDefault();
-    solidMaterial.maps[MATERIAL_MAP_DIFFUSE].color = WHITE;
-    DrawMesh(model.meshes[model.selectedFace], solidMaterial, centeredTransform);
-    UnloadMaterial(solidMaterial);
-    rlEnableWireMode();
-    Material wireMaterial = LoadMaterialDefault();
-    wireMaterial.maps[MATERIAL_MAP_DIFFUSE].color = YELLOW;
-    DrawMesh(model.meshes[model.selectedFace], wireMaterial, centeredTransform);
-    UnloadMaterial(wireMaterial);
-    rlDisableWireMode();
+    {
+        Material solidMaterial = LoadMaterialDefault();
+        solidMaterial.maps[MATERIAL_MAP_DIFFUSE].color = WHITE;
+        DrawMesh(model.meshes[model.selectedFace], solidMaterial, centeredTransform);
+        UnloadMaterial(solidMaterial);
+
+        rlEnableWireMode();
+        {
+            Material wireMaterial = LoadMaterialDefault();
+            wireMaterial.maps[MATERIAL_MAP_DIFFUSE].color = YELLOW;
+            DrawMesh(model.meshes[model.selectedFace], wireMaterial, centeredTransform);
+            UnloadMaterial(wireMaterial);
+        }
+        rlDisableWireMode();
+    }
     rlEnableBackfaceCulling();
 }
 
-// redraws the distance-reference face (shift+right clicked) with a brightened tint and orange wireframe
-// so it is visually distinct from both the scene and the primary selected face
+// redraws the distance-reference face (shift+right clicked) with a brightened tint (so we know we clicked well)
 static void drawDistFaceHighlight(const CadModel& model)
 {
     Vector3 center = modelCenter(model);
     Vector3 off = model.faceOffsets[model.distFace];
     Matrix centeredTransform = MatrixMultiply(MatrixTranslate(off.x, off.y, off.z), MatrixTranslate(-center.x, -center.y, -center.z));
     rlDisableBackfaceCulling();
-    // draw the face brighter by blending its base color toward white (+80 per channel)
-    Color base = model.colors[model.distFace];
-    Color brightened = { (unsigned char)std::min(255, (int)base.r + 80), (unsigned char)std::min(255, (int)base.g + 80),
-        (unsigned char)std::min(255, (int)base.b + 80), 255 };
-    Material solidMaterial = LoadMaterialDefault();
-    solidMaterial.maps[MATERIAL_MAP_DIFFUSE].color = brightened;
-    DrawMesh(model.meshes[model.distFace], solidMaterial, centeredTransform);
-    UnloadMaterial(solidMaterial);
+    {
+        Color base = model.colors[model.distFace];
+        Color brightened = { (unsigned char)std::min(255, (int)base.r + 80), (unsigned char)std::min(255, (int)base.g + 80),
+            (unsigned char)std::min(255, (int)base.b + 80), 255 };
+        Material solidMaterial = LoadMaterialDefault();
+        solidMaterial.maps[MATERIAL_MAP_DIFFUSE].color = brightened;
+        DrawMesh(model.meshes[model.distFace], solidMaterial, centeredTransform);
+        UnloadMaterial(solidMaterial);
+    }
     rlEnableBackfaceCulling();
 }
 
@@ -1484,7 +1451,7 @@ static void drawModelBbox(const CadModel& model)
     DrawBoundingBox(dynamicBbox, GOLD);
 }
 
-// draws the bounding box of the selected face in orange, for planes this will be a near-flat rectangle, for cylinders/tori a proper 3D box
+// draws the bounding box of the selected face in orange, for planes this will be a flat rectangle, for cylinders/tori a proper 3D box
 static void drawFaceBbox(const CadModel& model)
 {
     if (model.selectedFace < 0 || model.selectedFace >= (int)model.pickData.size())
@@ -1629,12 +1596,12 @@ static void retessCylinderFace(CadModel& model, int cylIdx, double newHeightMin,
         rawAngleMax = std::max(rawAngleMax, angle);
     }
     double angleMin = rawAngleMin, angleMax = rawAngleMax;
-    // same full-revolution detection as tessCylinder: span > 1.9*pi -> treat as full circle
+    // same full-revolution detection as tessCylinder, span > 1.9*pi -> treat as full circle
     if (rawAngleMax - rawAngleMin > 1.9 * M_PI) {
         angleMin = 0;
         angleMax = 2 * M_PI;
     }
-    // reconstruct uCount from the original tessellation: vertex count per row = uCount+1, total front rows = 2 (vSteps=1)
+    // reconstruct uCount from the original tessellation, vertex count per row = uCount+1, total front rows = 2 (vSteps=1)
     // frontVertexCount = (uCount+1) * (1+1), so uCount = frontVertexCount/2 - 1
     int uCount = std::max(2, frontVertexCount / 2 - 1);
 
@@ -1658,6 +1625,8 @@ static void retessCylinderFace(CadModel& model, int cylIdx, double newHeightMin,
 
 // checks if two faces share at least one vertex within eps (front-face vertices only)
 // used to confirm a plane and a cylinder are topologically connected at a cap, planeOff and cylOff are the current draw-space offsets of each face
+// could use our vec3.near but would be slightly worse because would calls sqrt per pair when all we need is to compare distance
+// not actually get them (so we dont need to sqrt)
 static bool facesShareVertex(const TessellatedFace& planeData, Vector3 planeOff, const TessellatedFace& cylData, Vector3 cylOff, float eps = 0.05f)
 {
     int planeCount = (int)planeData.vertices.size() / 6;
@@ -1682,7 +1651,7 @@ static bool facesShareVertex(const TessellatedFace& planeData, Vector3 planeOff,
 }
 
 // builds the heal cache for the selected plane face at gesture start (rising edge of the translation)
-// scans all cylinders once: checks axis alignment and vertex adjacency at the current (initial) position,
+// scans all cylinders once, checks axis alignment and vertex adjacency at the current (initial) position,
 // records which cap each connected cylinder should extend so per-frame updates need no proximity work at all
 static std::vector<CylinderHealEntry> buildCylinderHealCache(const CadModel& model, int planeFaceIdx)
 {
@@ -1736,7 +1705,7 @@ static std::vector<CylinderHealEntry> buildCylinderHealCache(const CadModel& mod
     return cache;
 }
 
-// applies the cached heal entries for one frame: extends each recorded cylinder cap by the axial component of delta
+// applies the cached heal entries for one frame, extends each recorded cylinder cap by the axial component of delta
 // no proximity scan because the cache is stable for the entire gesture duration
 // when the plane crosses through the opposite cap (height range would invert), min/max are swapped and isMaxCap
 // is flipped so the cylinder mirrors correctly and subsequent frames continue healing from the new orientation
@@ -1817,8 +1786,8 @@ static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float&
         Vec3 xDir = surf.axis.xDir.norm();
         Vec3 yDir = zDir.cross(xDir).norm();
         Vector3& off = model.faceOffsets[model.selectedFace];
-        translating = IsKeyDown(KEY_UP) || IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_RIGHT)
-            || IsKeyDown(KEY_PAGE_UP) || IsKeyDown(KEY_PAGE_DOWN);
+        translating
+            = IsKeyDown(KEY_UP) || IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_PAGE_UP) || IsKeyDown(KEY_PAGE_DOWN);
         if (translating && !wasTranslating) {
             model.undoStack.push_back({ model.selectedFace, off });
             model.redoStack.clear();
@@ -1838,32 +1807,44 @@ static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float&
         Vec3 planeNormal = surf.axis.zDir.norm();
         if (IsKeyDown(KEY_UP)) {
             Vector3 delta = { (float)zDir.x * step, (float)zDir.y * step, (float)zDir.z * step };
-            off.x += delta.x; off.y += delta.y; off.z += delta.z;
+            off.x += delta.x;
+            off.y += delta.y;
+            off.z += delta.z;
             applyCylinderHealCache(model, healCache, planeNormal, delta);
         }
         if (IsKeyDown(KEY_DOWN)) {
             Vector3 delta = { -(float)zDir.x * step, -(float)zDir.y * step, -(float)zDir.z * step };
-            off.x += delta.x; off.y += delta.y; off.z += delta.z;
+            off.x += delta.x;
+            off.y += delta.y;
+            off.z += delta.z;
             applyCylinderHealCache(model, healCache, planeNormal, delta);
         }
         if (IsKeyDown(KEY_RIGHT)) {
             Vector3 delta = { (float)xDir.x * step, (float)xDir.y * step, (float)xDir.z * step };
-            off.x += delta.x; off.y += delta.y; off.z += delta.z;
+            off.x += delta.x;
+            off.y += delta.y;
+            off.z += delta.z;
             applyCylinderHealCache(model, healCache, planeNormal, delta);
         }
         if (IsKeyDown(KEY_LEFT)) {
             Vector3 delta = { -(float)xDir.x * step, -(float)xDir.y * step, -(float)xDir.z * step };
-            off.x += delta.x; off.y += delta.y; off.z += delta.z;
+            off.x += delta.x;
+            off.y += delta.y;
+            off.z += delta.z;
             applyCylinderHealCache(model, healCache, planeNormal, delta);
         }
         if (IsKeyDown(KEY_PAGE_UP)) {
             Vector3 delta = { (float)yDir.x * step, (float)yDir.y * step, (float)yDir.z * step };
-            off.x += delta.x; off.y += delta.y; off.z += delta.z;
+            off.x += delta.x;
+            off.y += delta.y;
+            off.z += delta.z;
             applyCylinderHealCache(model, healCache, planeNormal, delta);
         }
         if (IsKeyDown(KEY_PAGE_DOWN)) {
             Vector3 delta = { -(float)yDir.x * step, -(float)yDir.y * step, -(float)yDir.z * step };
-            off.x += delta.x; off.y += delta.y; off.z += delta.z;
+            off.x += delta.x;
+            off.y += delta.y;
+            off.z += delta.z;
             applyCylinderHealCache(model, healCache, planeNormal, delta);
         }
     } else {
@@ -1902,7 +1883,7 @@ static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float&
 
 static void drawUI(const CadModel& model)
 {
-    // stats panel - running Y so adding lines never requires renumbering
+    // stats panel with running Y so adding lines never requires renumbering
     int uiY = 20;
     const int uiStep = 20;
     DrawText("RED = Cylinders", 20, uiY, 16, RED);
@@ -1944,9 +1925,8 @@ static void drawUI(const CadModel& model)
     uiY += 6;
     int faceIdx = model.selectedFace;
     int frontTris = (int)model.pickData[faceIdx].indices.size() / 6;
-    DrawText(
-        TextFormat("Face #%d [%s] | %d triangles | %.2f mm^2", faceIdx, surfaceKindName(model.pickData[faceIdx].kind), frontTris, model.faceAreas[faceIdx]), 20,
-        uiY, 16, YELLOW);
+    DrawText(TextFormat("Face #%d [%s] | %d triangles | %.2f mm^2", faceIdx, nameForKind(model.pickData[faceIdx].kind), frontTris, model.faceAreas[faceIdx]),
+        20, uiY, 16, YELLOW);
     uiY += uiStep;
 
     // face bbox dimensions and center (in draw space = relative to model center = world coords when model at origin)
