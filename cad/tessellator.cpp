@@ -24,7 +24,8 @@ static double area2D(const std::vector<Vec2>& polygon)
         auto &current = polygon[i], &next = polygon[(i + 1) % count];
         area += current.u * next.v - next.u * current.v;
     }
-    return area;
+    // shoelace gives 2*area, divide to get the true signed area
+    return area * 0.5;
 }
 
 // 2D cross product of vectors (b-a) and (c-a)
@@ -51,12 +52,16 @@ static std::vector<std::array<int, 3>> earClip(const std::vector<Vec2>& polygon)
     if (vertexCount < 3)
         return triangles;
     // working index ring: we'll remove vertices from this as ears are clipped
-    // ex: polygon with 5 verts -> remaining=[0,1,2,3,4]; clip ear at 1 -> remaining=[0,2,3,4]
-    std::vector<int> remaining(vertexCount);
-    std::iota(remaining.begin(), remaining.end(), 0);
+    // ex: polygon with 5 verts -> remaining={0,1,2,3,4}, clip ear at 1 -> remaining={0,2,3,4}
+    std::list<int> remaining;
+    for (int i = 0; i < vertexCount; i++)
+        remaining.push_back(i);
     // ensure CCW winding so the convexity test (cross > 0) is consistent
-    if (area2D(polygon) < 0)
-        std::reverse(remaining.begin(), remaining.end());
+    {
+        std::vector<Vec2> tmp(polygon.begin(), polygon.end());
+        if (area2D(tmp) < 0)
+            remaining.reverse();
+    }
 
     // vertexCount*vertexCount*2 iterations: more headroom for self-touching bridge-seam polygons
     // a plain convex polygon needs only vertexCount-2 clips; the *2+64 cushions degenerate flat ears
@@ -65,22 +70,26 @@ static std::vector<std::array<int, 3>> earClip(const std::vector<Vec2>& polygon)
     while ((int)remaining.size() > 3 && iterationCount++ < maxIterations) {
         int ringSize = (int)remaining.size();
         bool earFound = false;
-        for (int i = 0; i < ringSize; i++) {
-            int indexA = remaining[(i - 1 + ringSize) % ringSize], indexB = remaining[i], indexC = remaining[(i + 1) % ringSize];
+        for (auto it = remaining.begin(); it != remaining.end(); ++it) {
+            // find prev and next iterators with wraparound
+            auto prevIt = (it == remaining.begin()) ? std::prev(remaining.end()) : std::prev(it);
+            auto nextIt = std::next(it);
+            if (nextIt == remaining.end())
+                nextIt = remaining.begin();
+            int indexA = *prevIt, indexB = *it, indexC = *nextIt;
             double crossProduct = cross2D(polygon[indexA], polygon[indexB], polygon[indexC]);
             // skip reflex vertices (CW turn, crossProduct < 0); allow near-zero (flat) ears since
-            // bridge seams create collinear (lie on the same straight line) triples that must still be clipped
-            // ex: crossProduct = -0.5 -> skip (reflex);  crossProduct = 1e-11 -> accept (bridge seam flat ear)
+            // bridge seams create collinear triples that must still be clipped
             if (crossProduct < -1e-10)
                 continue;
 
             bool isEar = true;
-            for (int j = 0; j < ringSize && isEar; j++) {
-                if (j == (i - 1 + ringSize) % ringSize || j == i || j == (i + 1) % ringSize)
+            for (auto jt = remaining.begin(); jt != remaining.end() && isEar; ++jt) {
+                if (jt == prevIt || jt == it || jt == nextIt)
                     continue;
-                Vec2 candidate = polygon[remaining[j]];
+                Vec2 candidate = polygon[*jt];
                 // skip vertices geometrically coincident with ear vertices,
-                // bridge seams duplicate vertices; coincident points falsely fail the inside-test and block all valid ears
+                // bridge seams duplicate vertices; coincident points falsely fail the inside-test
                 const double coincidenceEps = 1e-9;
                 if ((std::abs(candidate.u - polygon[indexA].u) < coincidenceEps && std::abs(candidate.v - polygon[indexA].v) < coincidenceEps)
                     || (std::abs(candidate.u - polygon[indexB].u) < coincidenceEps && std::abs(candidate.v - polygon[indexB].v) < coincidenceEps)
@@ -96,7 +105,8 @@ static std::vector<std::array<int, 3>> earClip(const std::vector<Vec2>& polygon)
                     std::array<int, 3> triangle = { indexA, indexB, indexC };
                     triangles.push_back(triangle);
                 }
-                remaining.erase(remaining.begin() + i);
+                // O(1) erase via iterator — the whole reason we use std::list here
+                remaining.erase(it);
                 earFound = true;
                 break;
             }
@@ -106,11 +116,11 @@ static std::vector<std::array<int, 3>> earClip(const std::vector<Vec2>& polygon)
     }
     // last remaining triangle
     if ((int)remaining.size() == 3) {
-        double crossProduct = cross2D(polygon[remaining[0]], polygon[remaining[1]], polygon[remaining[2]]);
-        if (crossProduct > 1e-14) {
-            std::array<int, 3> triangle = { remaining[0], remaining[1], remaining[2] };
-            triangles.push_back(triangle);
-        }
+        auto it = remaining.begin();
+        int r0 = *it++, r1 = *it++, r2 = *it;
+        double crossProduct = cross2D(polygon[r0], polygon[r1], polygon[r2]);
+        if (crossProduct > 1e-14)
+            triangles.push_back({ r0, r1, r2 });
     }
     return triangles;
 }
@@ -121,6 +131,9 @@ static std::vector<std::array<int, 3>> earClip(const std::vector<Vec2>& polygon)
 // - find which outer polygon edge the ray hits first
 // - of the two endpoints of that edge, pick the one further right, that vertex is visible from your hole point by construction (the ray guarantees it)
 // - draw the bridge there
+
+// ex: outer square [A, B, C, D] and a triangular hole [H0, H1, H2] where B is the chosen bridge target and H0 is the chosen hole start,
+// the merged polygon becomes [A, B, H0, H1, H2, H0, B, C, D], B and H0 appear twice (the seams), B->H0 and H0->B are the bridge
 
 // when you have a polygon with a hole in it, the ear-clipper can only handle simple polygons (no holes)
 // a bridge cut is a straight line segment that connects a point on the hole boundary to a point on the outer boundary,
@@ -135,7 +148,7 @@ static std::vector<std::array<int, 3>> earClip(const std::vector<Vec2>& polygon)
 static int findBridgeVertex(const std::vector<Vec2>& polygon, Vec2 rayOrigin)
 {
     int vertexCount = (int)polygon.size();
-    double closestDistance = 1e18;
+    double closestDistance = std::numeric_limits<double>::max();
     int bestEdgeIndex = -1;
 
     for (int i = 0; i < vertexCount; i++) {
@@ -166,7 +179,7 @@ static int findBridgeVertex(const std::vector<Vec2>& polygon, Vec2 rayOrigin)
 
     if (bestEdgeIndex < 0) {
         // fallback: nearest vertex (handles degenerate geometry where no edge is hit)
-        double bestDistSq = 1e18;
+        double bestDistSq = std::numeric_limits<double>::max();
         int nearestVertex = 0;
         for (int i = 0; i < vertexCount; i++) {
             double distSq = (polygon[i].u - rayOrigin.u) * (polygon[i].u - rayOrigin.u) + (polygon[i].v - rayOrigin.v) * (polygon[i].v - rayOrigin.v);
@@ -198,13 +211,13 @@ static std::vector<Vec2> buildMergedPolygon(const std::vector<Vec2>& outer, cons
     // ex: two holes with rightmost X=8 and X=3 -> process X=8 hole first
     std::vector<int> holeOrder((int)holes.size());
     std::iota(holeOrder.begin(), holeOrder.end(), 0);
+    // pre-compute rightmost U per hole so the comparator doesn't re-walk each hole on every comparison
+    std::vector<double> rightmostU(holes.size(), -std::numeric_limits<double>::max());
+    for (int h = 0; h < (int)holes.size(); h++)
+        for (auto& vertex : holes[h])
+            rightmostU[h] = std::max(rightmostU[h], vertex.u);
     std::sort(holeOrder.begin(), holeOrder.end(), [&](int holeA, int holeB) {
-        double rightmostA = -1e18, rightmostB = -1e18;
-        for (auto& vertex : holes[holeA])
-            rightmostA = std::max(rightmostA, vertex.u);
-        for (auto& vertex : holes[holeB])
-            rightmostB = std::max(rightmostB, vertex.u);
-        return rightmostA > rightmostB;
+        return rightmostU[holeA] > rightmostU[holeB];
     });
 
     std::vector<Vec2> merged = outer;
@@ -298,20 +311,28 @@ TessellatedFace tessGrid(SurfaceKind kind, std::function<Vec3(double u, double v
     // row stride in the flat vertex array: one row = uSteps+1 vertices
     // ex: uSteps=3 -> stride=4; vertex at grid cell (ui=2, vi=1) is at flat index 1*4+2 = 6
     int stride = uSteps + 1;
+
+    // cache front-vertex positions so the back-vertex pass can reuse them without calling positionFn again
+    // (avoids duplicate sin/cos for cylinders and tori which compute radial direction inside positionFn)
+    std::vector<Vec3> frontPos;
+    frontPos.reserve((uSteps + 1) * (vSteps + 1));
+
     // front vertices: grid of (uSteps+1)*(vSteps+1) points sampled at each (u,v)
     for (int vi = 0; vi <= vSteps; vi++)
         for (int ui = 0; ui <= uSteps; ui++) {
             double u = u0 + (u1 - u0) * (double)ui / uSteps, v = v0 + (v1 - v0) * (double)vi / vSteps;
-            appendVertex(face, positionFn(u, v), normalFn(u, v));
+            Vec3 pos = positionFn(u, v);
+            frontPos.push_back(pos);
+            appendVertex(face, pos, normalFn(u, v));
         }
     // frontVertexCount = total front vertex count; back vertices start at index frontVertexCount
     // ex: uSteps=3, vSteps=2 -> frontVertexCount=4*3=12; back verts are indices 12 to 23
     int frontVertexCount = (uSteps + 1) * (vSteps + 1);
-    // back vertices: same positions as front but normals flipped for inside rendering
+    // back vertices just reuse cached front positions, only flip the normal for inside rendering
     for (int vi = 0; vi <= vSteps; vi++)
         for (int ui = 0; ui <= uSteps; ui++) {
             double u = u0 + (u1 - u0) * (double)ui / uSteps, v = v0 + (v1 - v0) * (double)vi / vSteps;
-            appendVertex(face, positionFn(u, v), normalFn(u, v) * -1.0);
+            appendVertex(face, frontPos[vi * stride + ui], normalFn(u, v) * -1.0);
         }
     // emit two triangles per quad cell (CCW front, CW back)
     // quad corners: bottomLeft, bottomRight, topLeft, topRight
@@ -338,7 +359,7 @@ static TessellatedFace tessCylinder(const Surface& surface, const std::vector<Bo
 
     // compute height range [heightMin, heightMax] by projecting all boundary points onto the cylinder axis
     // ex: screw shank with top boundary at h=10 and bottom at h=0 -> heightMin=0, heightMax=10
-    double heightMin = 1e18, heightMax = -1e18;
+    double heightMin = std::numeric_limits<double>::max(), heightMax = -std::numeric_limits<double>::max();
     bool fullRevolution = false;
     for (auto& loop : loops) {
         if (loop.hasFullCircle)
@@ -358,7 +379,7 @@ static TessellatedFace tessCylinder(const Surface& surface, const std::vector<Bo
     if (!fullRevolution) {
         // project each boundary point onto the XY plane and compute its angle
         // ex: point at (radius,0,h) -> angle=0;  point at (0,radius,h) -> angle=pi/2
-        double rawAngleMin = 1e18, rawAngleMax = -1e18;
+        double rawAngleMin = std::numeric_limits<double>::max(), rawAngleMax = -std::numeric_limits<double>::max();
         for (auto& loop : loops)
             for (auto& point : loop.points) {
                 Vec3 delta = point - origin;
@@ -388,8 +409,7 @@ static TessellatedFace tessCylinder(const Surface& surface, const std::vector<Bo
         return origin + radialDir * radius + Z * v;
     };
     // outward radial direction (same for all v at a given u),  ex: u=0 -> normal=(1,0,0);  u=pi/2 -> normal=(0,1,0)
-    auto normalFn = [&](double u, double v) -> Vec3 {
-        (void)v;
+    auto normalFn = [&](double u, [[maybe_unused]] double v) -> Vec3 {
         return (X * std::cos(u) + Y * std::sin(u));
     };
     return tessGrid(SurfaceKind::Cylinder, positionFn, normalFn, angleMin, angleMax, uCount, heightMin, heightMax, 1);
@@ -456,7 +476,7 @@ static TessellatedFace tessPlane(const Surface& surface, std::vector<BoundaryLoo
     }
     if (!outerLoop && !loops.empty()) {
         // fallback: treat largest-area loop as outer (STEP files occasionally mislabel)
-        double bestArea = -1e18;
+        double bestArea = -std::numeric_limits<double>::max();
         for (auto& loop : loops) {
             std::vector<Vec2> projected;
             Vec3 centroid = { 0, 0, 0 };
@@ -597,8 +617,11 @@ TessellatedFace tessellateAdvancedFace(int faceId, const StepMap& map, int arcSe
         return tessCylinder(surface, loops, arcSegs);
     case SurfaceKind::Torus:
         return tessTorus(surface, arcSegs, 24); // 24 tube segments is sufficient for fillet quality
-    default:
+    case SurfaceKind::Plane:
         return tessPlane(surface, loops, faceReversed);
+    default:
+        // unknown surface type, return empty rather than silently tessellating with the wrong model
+        return {};
     }
 }
 #pragma region gpu upload
@@ -606,7 +629,8 @@ TessellatedFace tessellateAdvancedFace(int faceId, const StepMap& map, int arcSe
 // exact for planar faces (ear-clip triangulates the exact boundary), approximate for curved surfaces (depends on arcSegs)
 float computeFaceArea(const TessellatedFace& face)
 {
-    float area = 0.0f;
+    // accumulate in double to reduce error on large faces, cast to float only at the final return
+    double area = 0.0;
     // total triangles / 2 = front-face triangles only (back faces are duplicated with reversed winding in the second half)
     int frontTriCount = (int)face.indices.size() / 6;
     for (int i = 0; i < frontTriCount; i++) {
@@ -615,9 +639,9 @@ float computeFaceArea(const TessellatedFace& face)
         Vec3 v0 = { face.vertices[i0], face.vertices[i0 + 1], face.vertices[i0 + 2] };
         Vec3 v1 = { face.vertices[i1], face.vertices[i1 + 1], face.vertices[i1 + 2] };
         Vec3 v2 = { face.vertices[i2], face.vertices[i2 + 1], face.vertices[i2 + 2] };
-        area += 0.5f * (float)(v1 - v0).cross(v2 - v0).len(); // triangle area formula
+        area += 0.5 * (v1 - v0).cross(v2 - v0).len(); // triangle area formula
     }
-    return area;
+    return (float)area;
 }
 
 // allocates and fills a Raylib Mesh from a TessellatedFace, then uploads it from CPU RAM to the GPU's to draw it later
@@ -657,23 +681,45 @@ void retessCylinderFace(CadModel& model, int cylIdx, double newHeightMin, double
     double radius = surf.majorRadius;
 
     // reconstruct the angle range from the existing pickData (we cannot re-run sampleLoop without the StepMap)
-    // project all front-face vertices onto the XY plane of the cylinder and recover the angle sweep
+    // use the largest-gap method: sort all sampled angles, find the biggest empty sector, then define the arc
+    // as the complement so arcs straddling the atan2 +-pi discontinuity are handled correctly
+    // ex: arc from 150 to 210 deg straddles pi -> raw min=-pi, raw max~pi, naive span~2pi -> wrongly treated as full circle
+    //     largest-gap method finds the gap from ~210 to ~150 (the ~300 deg empty sector) and takes the complement (~60 deg arc)
     const TessellatedFace& oldFace = model.pickData[cylIdx];
     int frontVertexCount = (int)oldFace.vertices.size() / 6;
-    double rawAngleMin = 1e18, rawAngleMax = -1e18;
+    std::vector<double> angles;
+    angles.reserve(frontVertexCount);
     for (int vi = 0; vi < frontVertexCount; vi++) {
         int base = vi * 3;
         Vec3 pt = { oldFace.vertices[base], oldFace.vertices[base + 1], oldFace.vertices[base + 2] };
         Vec3 delta = pt - origin;
-        double angle = std::atan2(delta.dot(Y), delta.dot(X));
-        rawAngleMin = std::min(rawAngleMin, angle);
-        rawAngleMax = std::max(rawAngleMax, angle);
+        angles.push_back(std::atan2(delta.dot(Y), delta.dot(X)));
     }
-    double angleMin = rawAngleMin, angleMax = rawAngleMax;
-    // same full-revolution detection as tessCylinder, span > 1.9*pi -> treat as full circle
-    if (rawAngleMax - rawAngleMin > 1.9 * M_PI) {
-        angleMin = 0;
-        angleMax = 2 * M_PI;
+    double angleMin = 0, angleMax = 2 * M_PI;
+    if (!angles.empty()) {
+        std::sort(angles.begin(), angles.end());
+        angles.erase(std::unique(angles.begin(), angles.end()), angles.end());
+        double biggestGap = 0;
+        int gapAfter = 0;
+        for (int i = 0; i < (int)angles.size(); i++) {
+            double next = (i + 1 < (int)angles.size()) ? angles[i + 1] : angles[0] + 2 * M_PI;
+            double gap = next - angles[i];
+            if (gap > biggestGap) {
+                biggestGap = gap;
+                gapAfter = i;
+            }
+        }
+        // if the biggest gap covers almost everything, it's a full revolution
+        if (biggestGap > 1.9 * M_PI) {
+            angleMin = 0;
+            angleMax = 2 * M_PI;
+        } else {
+            angleMin = angles[(gapAfter + 1) % (int)angles.size()];
+            angleMax = angles[gapAfter] + (angleMin > angles[gapAfter] ? 0 : 2 * M_PI);
+            // normalise so angleMax > angleMin
+            while (angleMax <= angleMin)
+                angleMax += 2 * M_PI;
+        }
     }
     // reconstruct uCount from the original tessellation, vertex count per row = uCount+1, total front rows = 2 (vSteps=1)
     // frontVertexCount = (uCount+1) * (1+1), so uCount = frontVertexCount/2 - 1
@@ -683,8 +729,7 @@ void retessCylinderFace(CadModel& model, int cylIdx, double newHeightMin, double
         Vec3 radialDir = X * std::cos(u) + Y * std::sin(u);
         return origin + radialDir * radius + Z * v;
     };
-    auto normalFn = [&](double u, double v) -> Vec3 {
-        (void)v;
+    auto normalFn = [&](double u, [[maybe_unused]] double v) -> Vec3 {
         return (X * std::cos(u) + Y * std::sin(u));
     };
     TessellatedFace newFace = tessGrid(SurfaceKind::Cylinder, positionFn, normalFn, angleMin, angleMax, uCount, newHeightMin, newHeightMax, 1);
@@ -701,6 +746,9 @@ void retessCylinderFace(CadModel& model, int cylIdx, double newHeightMin, double
 // used to confirm a plane and a cylinder are topologically connected at a cap, planeOff and cylOff are the current draw-space offsets of each face
 // could use our vec3.near but would be slightly worse because would calls sqrt per pair when all we need is to compare distance
 // not actually get them (so we dont need to sqrt)
+// back vertices are always exactly as many as front and stored contiguously after them (tessGrid and tessPlane both emit front then back),
+// so front_vertex_count = vertices.size()/3 / 2 = vertices.size()/6, base = i*3 then addresses XYZ within the front half only
+// if this invariant ever breaks, planeCount/cylCount will be wrong
 static bool facesShareVertex(const TessellatedFace& planeData, Vector3 planeOff, const TessellatedFace& cylData, Vector3 cylOff, float eps = 0.05f)
 {
     int planeCount = (int)planeData.vertices.size() / 6;

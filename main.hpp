@@ -8,6 +8,8 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
+#include <list>
 #include <numeric>
 #include <random>
 #include <raylib.h>
@@ -20,5 +22,5 @@
 #include <vector>
 
 #ifndef M_PI
-    #define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif

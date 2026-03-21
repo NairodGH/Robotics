@@ -48,7 +48,8 @@ CadModel loadStep(const std::string& path, int arcSegs)
     CadModel model;
     // initialize bbox inverted so the first real vertex always wins both min and max comparisons
     // ex: first vertex at (3,1,2) -> min becomes (3,1,2), max becomes (3,1,2)
-    model.bbox = { { 1e18f, 1e18f, 1e18f }, { -1e18f, -1e18f, -1e18f } };
+    model.bbox = { { std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() },
+        { -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max() } };
     StepMap entityMap = parseStepFile(path);
 
     // collect all ADVANCED_FACE entity IDs (each face becomes one mesh)
@@ -64,15 +65,17 @@ CadModel loadStep(const std::string& path, int arcSegs)
         TessellatedFace tessellatedFace = tessellateAdvancedFace(faceId, entityMap, arcSegs, &faceSurface);
         if (tessellatedFace.indices.empty())
             continue;
-        // expand the overall bounding box with all vertices of this face
-        // vertices are stored flat as [x0,y0,z0, x1,y1,z1, ...] so step 3 by 3
-        for (int i = 0; i + 2 < (int)tessellatedFace.vertices.size(); i += 3) {
-            model.bbox.min.x = std::min(model.bbox.min.x, tessellatedFace.vertices[i]);
-            model.bbox.min.y = std::min(model.bbox.min.y, tessellatedFace.vertices[i + 1]);
-            model.bbox.min.z = std::min(model.bbox.min.z, tessellatedFace.vertices[i + 2]);
-            model.bbox.max.x = std::max(model.bbox.max.x, tessellatedFace.vertices[i]);
-            model.bbox.max.y = std::max(model.bbox.max.y, tessellatedFace.vertices[i + 1]);
-            model.bbox.max.z = std::max(model.bbox.max.z, tessellatedFace.vertices[i + 2]);
+        // expand the overall bounding box with all front-face vertices of this face
+        // vertices are stored flat as [x0,y0,z0, ...front..., ...back...], back = same positions so only iterate front half
+        int frontVertCount = (int)tessellatedFace.vertices.size() / 6; // front_count = total_floats/3 / 2
+        for (int i = 0; i < frontVertCount; i++) {
+            int base = i * 3;
+            model.bbox.min.x = std::min(model.bbox.min.x, tessellatedFace.vertices[base]);
+            model.bbox.min.y = std::min(model.bbox.min.y, tessellatedFace.vertices[base + 1]);
+            model.bbox.min.z = std::min(model.bbox.min.z, tessellatedFace.vertices[base + 2]);
+            model.bbox.max.x = std::max(model.bbox.max.x, tessellatedFace.vertices[base]);
+            model.bbox.max.y = std::max(model.bbox.max.y, tessellatedFace.vertices[base + 1]);
+            model.bbox.max.z = std::max(model.bbox.max.z, tessellatedFace.vertices[base + 2]);
         }
         Mesh mesh = uploadMesh(tessellatedFace);
         if (mesh.vertexCount == 0)
@@ -89,8 +92,8 @@ CadModel loadStep(const std::string& path, int arcSegs)
         CylinderHeightRange chr;
         if (faceSurface.kind == SurfaceKind::Cylinder) {
             Vec3 cylOrigin = faceSurface.axis.origin, cylZ = faceSurface.axis.zDir.norm();
-            chr.heightMin = 1e18;
-            chr.heightMax = -1e18;
+            chr.heightMin = std::numeric_limits<double>::max();
+            chr.heightMax = -std::numeric_limits<double>::max();
             int frontVertexCount = (int)tessellatedFace.vertices.size() / 6;
             for (int vi = 0; vi < frontVertexCount; vi++) {
                 int base = vi * 3;
@@ -101,7 +104,7 @@ CadModel loadStep(const std::string& path, int arcSegs)
             }
         }
         model.cylHeightRanges.push_back(chr);
-        model.totalTriangleCount += (int)tessellatedFace.indices.size() / 6; // front triangles only
+        model.totalTriangleCount += (int)(tessellatedFace.indices.size() / 6); // front triangles only
     }
     return model;
 }
@@ -154,8 +157,9 @@ static int pickFace(const CadModel& model, Ray ray)
     ray.position.y += center.y;
     ray.position.z += center.z;
 
-    float closestT = 1e18f;
+    float closestT = std::numeric_limits<float>::max();
     int hitFace = -1;
+    // TODO: AABB pre-pass per face to cull before the triangle loop, brute-force is fine at current face counts but won't scale
     for (int faceIndex = 0; faceIndex < (int)model.pickData.size(); faceIndex++) {
         const auto& faceData = model.pickData[faceIndex];
         // offset is in draw space (post-centering), so add it to vertices in the same adjusted space
@@ -258,7 +262,8 @@ static void drawDistFaceHighlight(const CadModel& model)
 // computes the axis-aligned bounding box of the face in draw space (with centering applied)
 static BoundingBox computeFaceBBox(const TessellatedFace& face, Vector3 center, Vector3 offset = { 0.0f, 0.0f, 0.0f })
 {
-    BoundingBox bbox = { { 1e18f, 1e18f, 1e18f }, { -1e18f, -1e18f, -1e18f } };
+    BoundingBox bbox = { { std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() },
+        { -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max() } };
     int frontVertexCount = (int)face.vertices.size() / 6;
     for (int i = 0; i < frontVertexCount; i++) {
         int base = i * 3;
@@ -282,7 +287,7 @@ static BoundingBox computeFaceBBox(const TessellatedFace& face, Vector3 center, 
 static float computeFaceMinDistance(
     const TessellatedFace& faceA, const TessellatedFace& faceB, Vector3 offsetA = { 0.0f, 0.0f, 0.0f }, Vector3 offsetB = { 0.0f, 0.0f, 0.0f })
 {
-    float minDistSq = 1e18f;
+    float minDistSq = std::numeric_limits<float>::max();
     int countA = (int)faceA.vertices.size() / 6; // front vertices only
     int countB = (int)faceB.vertices.size() / 6;
     for (int i = 0; i < countA; i++) {
@@ -305,7 +310,8 @@ static float computeFaceMinDistance(
 static void drawModelBbox(const CadModel& model)
 {
     Vector3 center = modelCenter(model);
-    BoundingBox dynamicBbox = { { 1e18f, 1e18f, 1e18f }, { -1e18f, -1e18f, -1e18f } };
+    BoundingBox dynamicBbox = { { std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() },
+        { -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max() } };
     for (int fi = 0; fi < (int)model.pickData.size(); fi++) {
         const auto& face = model.pickData[fi];
         Vector3 off = model.faceOffsets[fi];
@@ -420,7 +426,8 @@ static void drawFaceAnalyticalAxis(const CadModel& model, float scale)
 // computes live model bbox across all faces including their current offsets, in STEP space (not draw space)
 static BoundingBox computeLiveModelBBox(const CadModel& model)
 {
-    BoundingBox bbox = { { 1e18f, 1e18f, 1e18f }, { -1e18f, -1e18f, -1e18f } };
+    BoundingBox bbox = { { std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() },
+        { -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max() } };
     for (int fi = 0; fi < (int)model.pickData.size(); fi++) {
         const auto& face = model.pickData[fi];
         Vector3 off = model.faceOffsets[fi];
@@ -503,9 +510,6 @@ static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float&
     // push/pull: move selected face along its surface's own axes
     // UP/DOWN = zDir (normal for planes, axis for cylinders/tori), LEFT/RIGHT = xDir (in-plane tangent), PgUp/PgDn = yDir (zDir×xDir)
     // wasTranslating detects the rising edge of a translation gesture so one continuous hold = one undo entry
-    static bool wasTranslating = false;
-    static int cachedHealFace = -1; // selectedFace at the time the heal cache was built
-    static std::vector<CylinderHealEntry> healCache; // built once per gesture, reused every frame until key release
     bool translating = false;
     if (model.selectedFace > -1) {
         float step = diagonal * 0.005f;
@@ -516,28 +520,28 @@ static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float&
         Vector3& off = model.faceOffsets[model.selectedFace];
         translating
             = IsKeyDown(KEY_UP) || IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_PAGE_UP) || IsKeyDown(KEY_PAGE_DOWN);
-        if (translating && !wasTranslating) {
+        if (translating && !model.wasTranslating) {
             // always rebuild at every gesture rising edge so connectivity is re-evaluated at the plane's current
             // position, a stale cache from a prior gesture must never carry over because the plane may have
             // been moved off-axis (disconnected from the cylinder) between gestures
-            healCache = buildCylinderHealCache(model, model.selectedFace);
-            cachedHealFace = model.selectedFace;
+            model.healCache = buildCylinderHealCache(model, model.selectedFace);
+            model.cachedHealFace = model.selectedFace;
             // snapshot the pre-gesture cylinder height ranges for every cylinder this gesture will heal so
             // undo/redo can retessellate them back to the correct extent, not just the plane offset
             UndoEntry entry;
             entry.faceIndex = model.selectedFace;
             entry.offsetBefore = off;
-            for (const auto& healEntry : healCache)
+            for (const auto& healEntry : model.healCache)
                 entry.cylSnapshots.push_back({ healEntry.cylFaceIdx, model.cylHeightRanges[healEntry.cylFaceIdx] });
             model.undoStack.push_back(std::move(entry));
             model.redoStack.clear();
         }
         // invalidate cache if the selected face changed between gestures
-        if (cachedHealFace != model.selectedFace) {
-            healCache.clear();
-            cachedHealFace = -1;
+        if (model.cachedHealFace != model.selectedFace) {
+            model.healCache.clear();
+            model.cachedHealFace = -1;
         }
-        wasTranslating = translating;
+        model.wasTranslating = translating;
         Vec3 planeNormal = surf.axis.zDir.norm();
         auto move = [&](int key, Vec3 dir) {
             if (!IsKeyDown(key))
@@ -546,7 +550,7 @@ static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float&
             off.x += delta.x;
             off.y += delta.y;
             off.z += delta.z;
-            applyCylinderHealCache(model, healCache, planeNormal, delta);
+            applyCylinderHealCache(model, model.healCache, planeNormal, delta);
         };
         move(KEY_UP, zDir);
         move(KEY_DOWN, zDir * -1.0);
@@ -555,51 +559,36 @@ static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float&
         move(KEY_PAGE_UP, yDir);
         move(KEY_PAGE_DOWN, yDir * -1.0);
     } else {
-        wasTranslating = false;
-        healCache.clear();
-        cachedHealFace = -1;
+        model.wasTranslating = false;
+        model.healCache.clear();
+        model.cachedHealFace = -1;
     }
 
     // (ctrl+z is swallowed by the Win32 message loop as ASCII SUB before Raylib sees the key event XDD)
     // both blocked while any translation key is held to prevent stomping an in-progress gesture
-    if (!translating && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) && IsKeyPressed(KEY_U)) {
-        if (!model.undoStack.empty()) {
-            UndoEntry entry = model.undoStack.back();
-            model.undoStack.pop_back();
-            // capture current cylinder height ranges before overwriting them so redo can restore forward state
-            UndoEntry redoEntry;
-            redoEntry.faceIndex = entry.faceIndex;
-            redoEntry.offsetBefore = model.faceOffsets[entry.faceIndex];
-            for (const auto& snap : entry.cylSnapshots)
-                redoEntry.cylSnapshots.push_back({ snap.cylFaceIdx, model.cylHeightRanges[snap.cylFaceIdx] });
-            model.redoStack.push_back(std::move(redoEntry));
-            model.faceOffsets[entry.faceIndex] = entry.offsetBefore;
-            for (const auto& snap : entry.cylSnapshots) {
-                model.cylHeightRanges[snap.cylFaceIdx] = snap.rangeBefore;
-                retessCylinderFace(model, snap.cylFaceIdx, snap.rangeBefore.heightMin, snap.rangeBefore.heightMax);
-            }
-            model.selectedFace = entry.faceIndex;
+    // same principle for both: pop from 'src', capture current state into an inverse entry, push to 'dst', then restore
+    auto applyUndoRedoStep = [&](std::vector<UndoEntry>& src, std::vector<UndoEntry>& dst) {
+        if (src.empty())
+            return;
+        UndoEntry entry = src.back();
+        src.pop_back();
+        UndoEntry inverse;
+        inverse.faceIndex = entry.faceIndex;
+        inverse.offsetBefore = model.faceOffsets[entry.faceIndex];
+        for (const auto& snap : entry.cylSnapshots)
+            inverse.cylSnapshots.push_back({ snap.cylFaceIdx, model.cylHeightRanges[snap.cylFaceIdx] });
+        dst.push_back(std::move(inverse));
+        model.faceOffsets[entry.faceIndex] = entry.offsetBefore;
+        for (const auto& snap : entry.cylSnapshots) {
+            model.cylHeightRanges[snap.cylFaceIdx] = snap.rangeBefore;
+            retessCylinderFace(model, snap.cylFaceIdx, snap.rangeBefore.heightMin, snap.rangeBefore.heightMax);
         }
-    }
-    if (!translating && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) && IsKeyPressed(KEY_Y)) {
-        if (!model.redoStack.empty()) {
-            UndoEntry entry = model.redoStack.back();
-            model.redoStack.pop_back();
-            // capture current cylinder height ranges before overwriting them so undo can restore backward state
-            UndoEntry undoEntry;
-            undoEntry.faceIndex = entry.faceIndex;
-            undoEntry.offsetBefore = model.faceOffsets[entry.faceIndex];
-            for (const auto& snap : entry.cylSnapshots)
-                undoEntry.cylSnapshots.push_back({ snap.cylFaceIdx, model.cylHeightRanges[snap.cylFaceIdx] });
-            model.undoStack.push_back(std::move(undoEntry));
-            model.faceOffsets[entry.faceIndex] = entry.offsetBefore;
-            for (const auto& snap : entry.cylSnapshots) {
-                model.cylHeightRanges[snap.cylFaceIdx] = snap.rangeBefore;
-                retessCylinderFace(model, snap.cylFaceIdx, snap.rangeBefore.heightMin, snap.rangeBefore.heightMax);
-            }
-            model.selectedFace = entry.faceIndex;
-        }
-    }
+        model.selectedFace = entry.faceIndex;
+    };
+    if (!translating && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) && IsKeyPressed(KEY_U))
+        applyUndoRedoStep(model.undoStack, model.redoStack);
+    if (!translating && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) && IsKeyPressed(KEY_Y))
+        applyUndoRedoStep(model.redoStack, model.undoStack);
 
     // convert spherical (yaw, pitch, orbitRadius) to Cartesian camera position (x y z)
     // ex: yaw=90deg, pitch=0 -> camera sits on the +X axis looking toward origin

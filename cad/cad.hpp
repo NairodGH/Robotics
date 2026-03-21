@@ -3,14 +3,15 @@
 //  Raylib's Vec3 is float, we use Vec3 with doubles for STEP geometry computation where precision matters (ex: detecting coincident vertices)
 struct Vec3 {
     double x = 0, y = 0, z = 0;
-    Vec3 operator+(Vec3 o) const { return { x + o.x, y + o.y, z + o.z }; }
-    Vec3 operator-(Vec3 o) const { return { x - o.x, y - o.y, z - o.z }; }
+    // const refs to avoid a copy on non-register ABIs (and is safe if the struct ever gains more fields)
+    Vec3 operator+(const Vec3& o) const { return { x + o.x, y + o.y, z + o.z }; }
+    Vec3 operator-(const Vec3& o) const { return { x - o.x, y - o.y, z - o.z }; }
     Vec3 operator*(double t) const { return { x * t, y * t, z * t }; }
     // measures how much two vectors point in the same direction (1 = same, 0 = perpendicular, -1 = opposite)
-    double dot(Vec3 o) const { return x * o.x + y * o.y + z * o.z; }
+    double dot(const Vec3& o) const { return x * o.x + y * o.y + z * o.z; }
     // gives a vector perpendicular to both, and its sign (of its Z component in 2D) tells you which side of a line a point is on
     // positive = left turn, negative = right turn
-    Vec3 cross(Vec3 o) const { return { y * o.z - z * o.y, z * o.x - x * o.z, x * o.y - y * o.x }; }
+    Vec3 cross(const Vec3& o) const { return { y * o.z - z * o.y, z * o.x - x * o.z, x * o.y - y * o.x }; }
     double len() const { return std::sqrt(x * x + y * y + z * z); }
     // returns a unit-length copy of this vector, or (0,0,1) if the vector is degenerate (near-zero length)
     // the 1e-14 threshold guards against division by zero from floating-point underflow
@@ -121,6 +122,10 @@ struct CadModel {
     // SoA per translation
     std::vector<UndoEntry> undoStack; // pushed once on gesture
     std::vector<UndoEntry> redoStack; // cleared on new translation, populated by undo
+    // per-gesture translation state, kept here instead of as static locals in handleControls so a second model or viewport never shares them
+    bool wasTranslating = false;
+    int cachedHealFace = -1; // selectedFace at the time the heal cache was built, -1 = stale
+    std::vector<CylinderHealEntry> healCache; // built once at gesture start (rising edge), reused every frame until key release
     // measurements
     BoundingBox bbox;
     int totalTriangleCount = 0;

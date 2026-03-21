@@ -10,6 +10,8 @@ std::vector<std::string> splitTopLevel(const std::string& input)
     std::vector<std::string> result;
     int depth = 0;
     std::string current;
+    // reserve up front, current can grow up to input.size() in the worst case (no commas)
+    current.reserve(input.size());
     for (char c : input) {
         if (c == '(') {
             depth++;
@@ -54,7 +56,9 @@ double dbl(const std::string& input)
 {
     try {
         return std::stod(trimWS(input));
-    } catch (...) {
+    } catch (const std::invalid_argument&) {
+        return 0.0;
+    } catch (const std::out_of_range&) {
         return 0.0;
     }
 }
@@ -286,10 +290,11 @@ static std::vector<Vec3> sampleBSpline(int id, Vec3 startPt, Vec3 endPt, const S
     // ex: degree 3 needs at least 4 control points
     if ((int)controlPoints.size() <= degree)
         return { startPt, endPt };
-    // scan remaining params for the knot vector: first parenthesised list of plain floats with enough entries, must have n+degree+1 knots for n control points
-    // go 3 by 3 for coords, tokenize commas, check for no ref but actual convertible doubles (allNumeric false means something wrong)
+    // scan remaining params for the knot vector: skip the first parenthesised plain-float list (the multiplicity list)
+    // and accept the second one, which is the actual knot vector
     // ex: 4 ctrl pts, degree 3 -> need 4+3+1=8 knots, ex: (0,0,0,0,1,1,1,1)
     std::vector<double> knots;
+    int floatListsSeen = 0;
     for (int i = 3; i < (int)params.size() && knots.empty(); i++) {
         std::string token = trimWS(params[i]);
         if (token.empty() || token[0] != '(')
@@ -305,12 +310,19 @@ static std::vector<Vec3> sampleBSpline(int id, Vec3 startPt, Vec3 endPt, const S
             }
             try {
                 candidates.push_back(std::stod(trimmedValue));
-            } catch (...) {
+            } catch (const std::invalid_argument&) {
+                allNumeric = false;
+                break;
+            } catch (const std::out_of_range&) {
                 allNumeric = false;
                 break;
             }
         }
-        if (allNumeric && (int)candidates.size() >= (int)controlPoints.size() + degree + 1)
+        if (!allNumeric)
+            continue;
+        floatListsSeen++;
+        // first plain-float list = multiplicities, second = knots (STEP spec ordering)
+        if (floatListsSeen == 2 && (int)candidates.size() >= (int)controlPoints.size() + degree + 1)
             knots = candidates;
     }
     if (knots.empty())
