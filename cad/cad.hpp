@@ -97,8 +97,10 @@ struct CylinderHeightSnapshot {
 // one entry on the undo/redo stack
 struct UndoEntry {
     int faceIndex; // which face moved
-    Vector3 offsetBefore; // what its offset was before the move began
+    Vector3 oldOffset; // what its offset was before the move began
     std::vector<CylinderHeightSnapshot> cylSnapshots; // height ranges of every cylinder healed during this gesture, empty when no heal occurred
+    // (faceIndex, oldOffset) for every face down the constraints chain moved by constraint propagation
+    std::vector<std::pair<int, Vector3>> propagatedOffsets;
 };
 
 // one entry in the per-gesture heal cache, which cylinder to extend and which cap to move
@@ -108,29 +110,75 @@ struct CylinderHealEntry {
     double axisDotNormal; // dot(cylAxis, planeNormal) = about 1, preserves sign for signedDelta each frame
 };
 
-// final GPU model, many are SoA (Struct of Arrays) related index wise for their specific tasks
+enum class ConstraintKind { Distance, Symmetry };
+
+// one active constraint pairing between two faces, faceA < faceB always (so lookup stays cheap)
+struct ConstraintPair {
+    int faceA = -1, faceB = -1;
+    bool hasDistance = false; // both faces must stay apart from each other by the declaration time distance
+    float targetDistance = 0.0f; // which is stored here
+    bool hasSymmetry = false; // both faces must stay equidistant from the declaration time midpoint
+    float symmetryMidpoint = 0.0f; // which is stored here
+};
+
+// fading notification shown briefly at the bottom-center of the viewport
+struct Toast {
+    std::string message;
+    float timeLeft = 0.0f;
+};
+
+// final GPU model (but more of a global bin struct xd), many are SoA (Struct of Arrays) related index wise for their specific tasks
+// SoA is the right choice for CAD because operations are almost never "do everything to one face" but instead are
+// "do one thing to all faces" or "do one thing to a subset of faces" so it's better to separate concerns than doing a big
+// struct Face { Mesh mesh; Color color; ... };
 struct CadModel {
     // SoA per mesh
     std::vector<Mesh> meshes;
     std::vector<Color> colors;
+
     // SoA per face
     std::vector<TessellatedFace> pickData; // CPU copy kept after GPU upload, for mouse ray picking and analysis
     std::vector<Surface> faceSurfaces; // analytical surface definition per face, for axis/normal display
     std::vector<float> faceAreas;
     std::vector<Vector3> faceOffsets; // per-face translation in draw space, applied on top of the centering transform at draw/query time
     std::vector<CylinderHeightRange> cylHeightRanges; // per-face cylinder axis height range, kept mutable for geometry healing, non-cylinders are zeroed
-    // SoA per translation
+
+    // per-gesture working states
+    // entries are gesture-scoped, stack persists for undo/redo
     std::vector<UndoEntry> undoStack; // pushed once on gesture
     std::vector<UndoEntry> redoStack; // cleared on new translation, populated by undo
-    // per-gesture translation state, kept here instead of as static locals in handleControls so a second model or viewport never shares them
-    bool wasTranslating = false;
-    int cachedHealFace = -1; // selectedFace at the time the heal cache was built, -1 = stale
-    std::vector<CylinderHealEntry> healCache; // built once at gesture start (rising edge), reused every frame until key release
-    // measurements
-    BoundingBox bbox;
-    int totalTriangleCount = 0;
+    std::vector<CylinderHealEntry> healCache; // built at gesture start, cleared at end
+    std::vector<std::pair<int, std::vector<CylinderHealEntry>>> propagatedHealCaches; // same, (faceIdx, healEntries) per propagated face
+    bool translating = false; // on translation key pressed
+    bool wasTranslating = false; // every frame after 1rst one while we're pressing
+    bool toastPushedThisGesture = false;
+    int cachedHealFace = -1; // selectedFace at the time the heal cache was built
+
+    // persistent interaction states
+    std::vector<ConstraintPair> constraints;
+    std::vector<Toast> toasts;
     int selectedFace = -1;
     int distFace = -1;
+    bool needsReset = false; // "persistent" for 1 frame lmao
+
+    // load-time constants
+    BoundingBox bbox;
+    int totalTriangleCount = 0;
+
+    // ok crazy stuff next (spent way too much searching for the problem): C++ Rule of Five says if you define any one of destructor, copy constructor, copy
+    // assignment, move constructor or move assignment, you probably need to define all five because they're all related to the same question of "who owns
+    // what and what happens when ownership transfers or ends", here we define destructor to unload our meshes from GPU (which it doesnt do on its own)
+
+    // the compiler's position is "you touched one, so I'm not sure what you want for the others, I'll either delete them or fall back to the old behavior
+    // rather than guess wrong", funny thing is since we defined destructor it decides to destroy move assignement whose old behavior
+    // (didn't exist before C++11) was copy, it copies IDs instead of moving them -> temporary destructor frees them -> live object holds dead handles -> gg
+    // tldr; compiler's caution about not generating something potentially wrong leads it to silently do something definitely wrong, so we have to explicitely
+    // define everything (delete copy which we dont want and use default constructor/move)
+    CadModel() = default;
+    CadModel(const CadModel&) = delete;
+    CadModel& operator=(const CadModel&) = delete;
+    CadModel(CadModel&&) = default;
+    CadModel& operator=(CadModel&&) = default;
     ~CadModel();
 };
 

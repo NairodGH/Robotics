@@ -40,6 +40,132 @@ static Vector3 modelCenter(const CadModel& model)
     return { (model.bbox.min.x + model.bbox.max.x) * 0.5f, (model.bbox.min.y + model.bbox.max.y) * 0.5f, (model.bbox.min.z + model.bbox.max.z) * 0.5f };
 }
 
+#pragma region constraints
+// distance: partner receives the same delta (rigid pair)
+// symmetry: partner receives delta with its normal-axis component negated (mirror)
+// both: axial component is already zero from clampDeltaForConstraints, so partner receives tangential only
+// (if translate on z, normal is 0 0 1, if incomingDelta is 3 4 5, axisScalar is 5 (0 if both ^) and tangential is everything else so 3 4 0)
+static Vector3 derivedDelta(const CadModel& model, const ConstraintPair& cp, Vector3 incomingDelta)
+{
+    if (cp.hasDistance && !cp.hasSymmetry)
+        return incomingDelta;
+    Vec3 normal = model.faceSurfaces[cp.faceA].axis.zDir.norm();
+    double axialScalar = normal.x * incomingDelta.x + normal.y * incomingDelta.y + normal.z * incomingDelta.z;
+    double axialmult = cp.hasDistance ? 0.0 : -1.0;
+    return { incomingDelta.x + (float)((axialmult - 1.0) * axialScalar * normal.x), incomingDelta.y + (float)((axialmult - 1.0) * axialScalar * normal.y),
+        incomingDelta.z + (float)((axialmult - 1.0) * axialScalar * normal.z) };
+}
+
+// DFS (Depth-first search, explores as far as possible along each branch before backtracking) over the constraint graph starting from
+// rootFace (root face we moved) with rootDelta (how much we moved), returns the full set of (faceIndex, deltaToApply) pairs for every transitively reachable
+// constrained face,
+static std::vector<std::pair<int, Vector3>> collectConstrainedMoves(const CadModel& model, int rootFace, Vector3 rootDelta)
+{
+    std::vector<std::pair<int, Vector3>> queue = { { rootFace, rootDelta } }; // ofc face we moved is in the list
+    std::vector<int> visited = { rootFace }; // and we already visited it
+    int workIdx = 0; // cursor into queue, advances instead of popping so queue doubles as the result
+    while (workIdx < (int)queue.size()) {
+        auto [currentFace, currentDelta] = queue[workIdx++];
+        for (const auto& constraintPair : model.constraints) {
+            if (constraintPair.faceA != currentFace && constraintPair.faceB != currentFace)
+                continue; // skip any string that doesn't involve the current face
+            int otherFace = (constraintPair.faceA == currentFace) ? constraintPair.faceB : constraintPair.faceA;
+            // skip already visited to avoid infinite loops in cyclic constraint graphs (faceA <-> faceB <-> faceC <-> faceA)
+            if (std::find(visited.begin(), visited.end(), otherFace) != visited.end())
+                continue;
+            visited.push_back(otherFace);
+            Vector3 otherDelta = derivedDelta(model, constraintPair, currentDelta);
+            queue.push_back({ otherFace, otherDelta }); // continue BFS from this face
+        }
+    }
+    queue.erase(queue.begin()); // remove rootFace, caller only wants the constrained partners
+    return queue;
+}
+
+// clamps the axial component of delta to zero for any pair directly on movingFace where both Distance
+// and Symmetry are active (because that combination fully locks the axis on that pair)
+// returns true if any clamping was applied so the caller can show a toast on the gesture rising edge
+static bool clampDeltaForConstraints(const CadModel& model, int movingFace, Vector3& delta)
+{
+    bool clamped = false;
+    for (const auto& cp : model.constraints) {
+        if (cp.faceA != movingFace && cp.faceB != movingFace)
+            continue; // get to a pair that involves movingFace
+        if (!cp.hasDistance || !cp.hasSymmetry)
+            continue; // if doesnt have both distance and symmetry dont bother
+        Vec3 normal = model.faceSurfaces[cp.faceA].axis.zDir.norm();
+        double axialScalar = normal.x * delta.x + normal.y * delta.y + normal.z * delta.z;
+        if (std::abs(axialScalar) < 1e-8)
+            continue; // purely tangential move (ex: translation on x or y when both are aligned on z), nothing to clamp
+        delta.x -= (float)(axialScalar * normal.x);
+        delta.y -= (float)(axialScalar * normal.y);
+        delta.z -= (float)(axialScalar * normal.z);
+        clamped = true;
+    }
+    return clamped;
+}
+
+// applies the (already-clamped) delta transitively across the full constraint graph from movingFace, using DFS so constraint chains (face1->face2->face3) are
+// all resolved in one call, each hop derives the correct delta for the next face via derivedDelta (follow for Distance, mirror for Symmetry), cylinder healing
+// uses the per-face propagatedHealCaches map keyed by face index so each cylinder is healed exactly once with the correct delta for the face that caps it,
+// regardless of how many constraint pairs involve that face
+static void propagateConstraints(CadModel& model, int movingFace, Vector3 delta)
+{
+    for (auto& [otherFace, od] : collectConstrainedMoves(model, movingFace, delta)) {
+        model.faceOffsets[otherFace].x += od.x;
+        model.faceOffsets[otherFace].y += od.y;
+        model.faceOffsets[otherFace].z += od.z;
+        // look up the heal cache built specifically for otherFace at gesture start
+        for (auto& [cacheIdx, cacheEntries] : model.propagatedHealCaches) {
+            if (cacheIdx != otherFace)
+                continue;
+            Vec3 faceNormal = model.faceSurfaces[otherFace].axis.zDir.norm();
+            applyCylinderHealCache(model, cacheEntries, faceNormal, od);
+            break; // each face has exactly one entry in the map so dont bother continuing
+        }
+    }
+}
+
+// returns the centroid of a face (mean aka just add all vertices then divide result by number of vertices)
+// in draw space (STEP-space vertices shifted by -modelCenter + faceOffset, beecause in drawCadModel we MatrixTranslate(-center.x, -center.y, -center.z)
+// every mesh before drawing it so the model appears centered at the world origin regardless of where the STEP file placed it),
+static Vector3 faceCentroid(const CadModel& model, int faceIdx)
+{
+    const TessellatedFace& face = model.pickData[faceIdx];
+    Vector3 center = modelCenter(model);
+    Vector3 off = model.faceOffsets[faceIdx];
+    int frontVertCount = (int)face.vertices.size() / 6; // only front-face vertices
+    if (frontVertCount == 0)
+        return { 0.0f, 0.0f, 0.0f };
+    Vector3 sum = { 0.0f, 0.0f, 0.0f };
+    for (int i = 0; i < frontVertCount; i++) {
+        int base = i * 3;
+        sum.x += face.vertices[base] - center.x + off.x;
+        sum.y += face.vertices[base + 1] - center.y + off.y;
+        sum.z += face.vertices[base + 2] - center.z + off.z;
+    }
+    float inv = 1.0f / (float)frontVertCount;
+    return { sum.x * inv, sum.y * inv, sum.z * inv };
+}
+
+// signed distance from origin (0 0 0) to centroid's closest point when going in normal direction
+// ex: normal 0 0 1, centroid at 5 3 10, result is 10, if centroid at 5 3 -10 then -10 (can't get closer when following normal's path)
+static float computeAxialPos(const CadModel& model, int faceIdx, int normalRefFaceIdx)
+{
+    Vec3 normal = model.faceSurfaces[normalRefFaceIdx].axis.zDir.norm();
+    Vector3 centroid = faceCentroid(model, faceIdx);
+    return (float)(normal.x * centroid.x + normal.y * centroid.y + normal.z * centroid.z);
+}
+
+// returns the 3D distance between two face centroids
+static float computeCentroidDistance(const CadModel& model, int faceIdxA, int faceIdxB)
+{
+    Vector3 cA = faceCentroid(model, faceIdxA);
+    Vector3 cB = faceCentroid(model, faceIdxB);
+    float dx = cB.x - cA.x, dy = cB.y - cA.y, dz = cB.z - cA.z;
+    return sqrtf(dx * dx + dy * dy + dz * dz);
+}
+
 #pragma region loadStep
 // arcSegs: arc subdivision count (circles, cylinders, tori), essentially LOD
 // 48 segments is an arbitrary feel-tuned value for smooth circles, I'll also use half of it for smaller torus tubes later
@@ -479,7 +605,9 @@ static void drawModelAverageNormal(const CadModel& model, float scale)
 }
 
 #pragma region handleControls
-static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float& pitch, float& orbitRadius, bool& showNormals, bool& showBbox, float diagonal)
+// global stuff like camera, N, B, select, constraint panel click, toast decay...
+static void handleDefaultControls(
+    CadModel& model, Camera3D& camera, float& yaw, float& pitch, float& orbitRadius, bool& showNormals, bool& showBbox, float diagonal)
 {
     // left mouse drag -> orbit
     if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
@@ -499,6 +627,11 @@ static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float&
         orbitRadius = diagonal * 0.1f;
     if (orbitRadius > diagonal * 10.f)
         orbitRadius = diagonal * 10.f;
+    // convert spherical (yaw, pitch, orbitRadius) to Cartesian camera position (x y z) that raylib wants
+    // ex: yaw=90deg, pitch=0 -> camera sits on the +X axis looking toward origin
+    float yawRadians = DEG2RAD * yaw, pitchRadians = DEG2RAD * pitch;
+    camera.position = { orbitRadius * std::cos(pitchRadians) * std::sin(yawRadians), orbitRadius * std::sin(pitchRadians),
+        orbitRadius * std::cos(pitchRadians) * std::cos(yawRadians) };
 
     if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
         int hitFace = pickFace(model, GetMouseRay(GetMousePosition(), camera));
@@ -511,15 +644,50 @@ static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float&
         }
     }
 
+    // constraint panel, reset button at top reloads the scene, entries below remove that pair, see drawConstraintPanel
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        Vector2 mouse = GetMousePosition();
+        int panelX = GetScreenWidth() - 240; // 220 panelWidth + 20 right offset
+        const int resetButtonH = 24;
+        const int entryH = 26, entryGap = 3;
+        Rectangle resetRect = { (float)panelX, 20.0f, 220.0f, (float)resetButtonH };
+        if (CheckCollisionPointRec(mouse, resetRect)) {
+            model.needsReset = true;
+        } else {
+            int entryY = 20 + resetButtonH + 4 + 20; // top margin + reset button + gap + header height
+            for (int i = 0; i < (int)model.constraints.size(); i++) {
+                Rectangle entryRect = { (float)panelX, (float)entryY, 220.0f, (float)entryH };
+                if (CheckCollisionPointRec(mouse, entryRect)) {
+                    model.constraints.erase(model.constraints.begin() + i);
+                    break;
+                }
+                entryY += entryH + entryGap;
+            }
+        }
+    }
+
     if (IsKeyPressed(KEY_N))
         showNormals = !showNormals;
     if (IsKeyPressed(KEY_B))
         showBbox = !showBbox;
 
-    // push/pull: move selected face along its surface's own axes
-    // UP/DOWN = zDir (normal for planes, axis for cylinders/tori), LEFT/RIGHT = xDir (in-plane tangent), PgUp/PgDn = yDir (zDir×xDir)
+    // decay active toasts, subtract frame time each frame and remove expired entries
+    float dt = GetFrameTime();
+    model.toasts.erase(std::remove_if(model.toasts.begin(), model.toasts.end(),
+                           [&](Toast& t) {
+                               t.timeLeft -= dt;
+                               return t.timeLeft <= 0.0f;
+                           }),
+        model.toasts.end());
+}
+
+// translation, undo/redo
+static void handle1SelectControls(CadModel& model, float diagonal)
+{
+    // move selected face along its surface's own axes
+    // UP/DOWN = zDir (normal for planes, axis for cylinders/tori), LEFT/RIGHT = xDir (in-plane tangent), PageUp/PageDown = yDir (zDir*xDir)
     // wasTranslating detects the rising edge of a translation gesture so one continuous hold = one undo entry
-    bool translating = false;
+    model.translating = false;
     if (model.selectedFace > -1) {
         float step = diagonal * 0.005f;
         const Surface& surf = model.faceSurfaces[model.selectedFace];
@@ -527,39 +695,72 @@ static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float&
         Vec3 xDir = surf.axis.xDir.norm();
         Vec3 yDir = zDir.cross(xDir).norm();
         Vector3& off = model.faceOffsets[model.selectedFace];
-        translating
+        model.translating
             = IsKeyDown(KEY_UP) || IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_PAGE_UP) || IsKeyDown(KEY_PAGE_DOWN);
-        if (translating && !model.wasTranslating) {
-            // always rebuild at every gesture rising edge so connectivity is re-evaluated at the plane's current
-            // position, a stale cache from a prior gesture must never carry over because the plane may have
-            // been moved off-axis (disconnected from the cylinder) between gestures
+        // if we just started pressing down a translation key
+        if (model.translating && !model.wasTranslating) {
+            // always rebuild at every gesture start so connectivity is re-evaluated at the plane's current position
             model.healCache = buildCylinderHealCache(model, model.selectedFace);
             model.cachedHealFace = model.selectedFace;
-            // snapshot the pre-gesture cylinder height ranges for every cylinder this gesture will heal so
-            // undo/redo can retessellate them back to the correct extent, not just the plane offset
+            // collect the set of faces down the constraints chains that will move along with the current selected face
+            Vec3 zDirSeed = model.faceSurfaces[model.selectedFace].axis.zDir.norm();
+            Vector3 unitSeed = { (float)zDirSeed.x, (float)zDirSeed.y, (float)zDirSeed.z };
+            auto constrainedMoves = collectConstrainedMoves(model, model.selectedFace, unitSeed);
+            // build one heal cache per partner face, keyed by face index
+            model.propagatedHealCaches.clear();
+            for (const auto& [partnerFace, _] : constrainedMoves)
+                model.propagatedHealCaches.push_back({ partnerFace, buildCylinderHealCache(model, partnerFace) });
+            // snapshot the pre-gesture offsets of the moving face and the ones of all faces down the constraints chains
             UndoEntry entry;
             entry.faceIndex = model.selectedFace;
-            entry.offsetBefore = off;
-            for (const auto& healEntry : model.healCache)
-                entry.cylSnapshots.push_back({ healEntry.cylFaceIdx, model.cylHeightRanges[healEntry.cylFaceIdx] });
+            entry.oldOffset = off;
+            for (const auto& [partnerFace, _] : constrainedMoves)
+                entry.propagatedOffsets.push_back({ partnerFace, model.faceOffsets[partnerFace] });
+            // cylinder snapshot covering all faces that will move (selected + all faces down the constraints chains)
+            std::vector<int> movingFaces = { model.selectedFace };
+            for (const auto& po : entry.propagatedOffsets)
+                movingFaces.push_back(po.first);
+            for (int mf : movingFaces) {
+                for (const auto& healEntry : buildCylinderHealCache(model, mf)) {
+                    bool already = false;
+                    for (const auto& snap : entry.cylSnapshots)
+                        if (snap.cylFaceIdx == healEntry.cylFaceIdx) {
+                            already = true;
+                            break;
+                        }
+                    if (!already)
+                        entry.cylSnapshots.push_back({ healEntry.cylFaceIdx, model.cylHeightRanges[healEntry.cylFaceIdx] });
+                }
+            }
             model.undoStack.push_back(std::move(entry));
             model.redoStack.clear();
         }
-        // invalidate cache if the selected face changed between gestures
+        // clear caches if the selected face changed between gestures
         if (model.cachedHealFace != model.selectedFace) {
             model.healCache.clear();
             model.cachedHealFace = -1;
+            model.propagatedHealCaches.clear();
         }
-        model.wasTranslating = translating;
+        model.wasTranslating = model.translating;
         Vec3 planeNormal = surf.axis.zDir.norm();
+        if (!model.translating)
+            model.toastPushedThisGesture = false; // show only error toast on translation key press (not on every translation frame xd)
         auto move = [&](int key, Vec3 dir) {
             if (!IsKeyDown(key))
                 return;
             Vector3 delta = { (float)dir.x * step, (float)dir.y * step, (float)dir.z * step };
+            // clamp axial component to zero for any fully-locked pair (Distance+Symmetry both active)
+            bool clamped = clampDeltaForConstraints(model, model.selectedFace, delta);
+            if (clamped && !model.toastPushedThisGesture) {
+                model.toasts.push_back({ "Axial motion blocked: Distance+Symmetry lock this axis", 2.5f });
+                model.toastPushedThisGesture = true;
+            }
             off.x += delta.x;
             off.y += delta.y;
             off.z += delta.z;
             applyCylinderHealCache(model, model.healCache, planeNormal, delta);
+            // propagate the delta to every face constrained to this one
+            propagateConstraints(model, model.selectedFace, delta);
         };
         move(KEY_UP, zDir);
         move(KEY_DOWN, zDir * -1.0);
@@ -568,50 +769,197 @@ static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float&
         move(KEY_PAGE_UP, yDir);
         move(KEY_PAGE_DOWN, yDir * -1.0);
     } else {
+        // user clicked outside model, unselecting everything so clear all
         model.wasTranslating = false;
         model.healCache.clear();
         model.cachedHealFace = -1;
+        model.propagatedHealCaches.clear();
     }
 
-    // (ctrl+z is swallowed by the Win32 message loop as ASCII SUB before Raylib sees the key event XDD)
-    // both blocked while any translation key is held to prevent stomping an in-progress gesture
-    // same principle for both: pop from 'src', capture current state into an inverse entry, push to 'dst', then restore
-    auto applyUndoRedoStep = [&](std::vector<UndoEntry>& src, std::vector<UndoEntry>& dst) {
-        if (src.empty())
+    // same principle for both: pop from source stack, capture current state into the opposite stack, push to destination stack, then restore
+    auto applyUndoRedoStep = [&](std::vector<UndoEntry>& source, std::vector<UndoEntry>& destination) {
+        if (source.empty())
             return;
-        UndoEntry entry = src.back();
-        src.pop_back();
-        UndoEntry inverse;
-        inverse.faceIndex = entry.faceIndex;
-        inverse.offsetBefore = model.faceOffsets[entry.faceIndex];
+        UndoEntry entry = source.back();
+        source.pop_back();
+        UndoEntry opposite;
+        opposite.faceIndex = entry.faceIndex;
+        opposite.oldOffset = model.faceOffsets[entry.faceIndex];
         for (const auto& snap : entry.cylSnapshots)
-            inverse.cylSnapshots.push_back({ snap.cylFaceIdx, model.cylHeightRanges[snap.cylFaceIdx] });
-        dst.push_back(std::move(inverse));
-        model.faceOffsets[entry.faceIndex] = entry.offsetBefore;
+            opposite.cylSnapshots.push_back({ snap.cylFaceIdx, model.cylHeightRanges[snap.cylFaceIdx] });
+        // capture current propagated offsets into the opposite stack before restoring, so redo can reverse the undo
+        for (const auto& [faceIdx, _] : entry.propagatedOffsets)
+            opposite.propagatedOffsets.push_back({ faceIdx, model.faceOffsets[faceIdx] });
+        destination.push_back(std::move(opposite));
+        model.faceOffsets[entry.faceIndex] = entry.oldOffset;
         for (const auto& snap : entry.cylSnapshots) {
             model.cylHeightRanges[snap.cylFaceIdx] = snap.rangeBefore;
             retessCylinderFace(model, snap.cylFaceIdx, snap.rangeBefore.heightMin, snap.rangeBefore.heightMax);
         }
+        // restore the offsets of faces down the constraints chains that got moved by propagation during this gesture
+        for (const auto& [faceIdx, oldOffset] : entry.propagatedOffsets)
+            model.faceOffsets[faceIdx] = oldOffset;
         model.selectedFace = entry.faceIndex;
     };
-    if (!translating && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) && IsKeyPressed(KEY_U))
+    // both blocked while any translation key is held to prevent messing with an in-progress gesture
+    // (ctrl+z is swallowed by the Win32 message loop before Raylib sees the key event XDD, so use ctrl+u instead...)
+    if (!model.translating && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) && IsKeyPressed(KEY_U))
         applyUndoRedoStep(model.undoStack, model.redoStack);
-    if (!translating && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) && IsKeyPressed(KEY_Y))
+    if (!model.translating && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) && IsKeyPressed(KEY_Y))
         applyUndoRedoStep(model.redoStack, model.undoStack);
-
-    // convert spherical (yaw, pitch, orbitRadius) to Cartesian camera position (x y z)
-    // ex: yaw=90deg, pitch=0 -> camera sits on the +X axis looking toward origin
-    float yawRadians = DEG2RAD * yaw, pitchRadians = DEG2RAD * pitch;
-    camera.position = { orbitRadius * std::cos(pitchRadians) * std::sin(yawRadians), orbitRadius * std::sin(pitchRadians),
-        orbitRadius * std::cos(pitchRadians) * std::cos(yawRadians) };
 }
 
-#pragma region drawUI
+// constraints
+static void handle2SelectControls(CadModel& model)
+{
+    if (!model.translating && model.selectedFace > -1 && model.distFace > -1) {
+        int fA = std::min(model.selectedFace, model.distFace); // always fA < fB so pair lookup is a simple/fast equality check
+        int fB = std::max(model.selectedFace, model.distFace);
+        auto pushToast = [&](const std::string& msg) { model.toasts.push_back({ msg, 3.0f }); };
+        auto findPairIdx = [&]() -> int { // returns the index of the existing pair for fA-fB or -1 if none
+            for (int i = 0; i < (int)model.constraints.size(); i++)
+                if (model.constraints[i].faceA == fA && model.constraints[i].faceB == fB)
+                    return i;
+            return -1;
+        };
+        // handle constraint related input
+        auto toggleKind = [&](ConstraintKind kind) {
+            int idx = findPairIdx();
+            ConstraintPair* constraintPair = (idx >= 0) ? &model.constraints[idx] : nullptr;
+            bool active = constraintPair
+                && ((kind == ConstraintKind::Distance && constraintPair->hasDistance) || (kind == ConstraintKind::Symmetry && constraintPair->hasSymmetry));
+            if (active) {
+                // toggle off (clear the kind, remove the entry entirely if no kinds remain)
+                if (kind == ConstraintKind::Distance)
+                    constraintPair->hasDistance = false;
+                else
+                    constraintPair->hasSymmetry = false;
+                if (!constraintPair->hasDistance && !constraintPair->hasSymmetry)
+                    model.constraints.erase(model.constraints.begin() + idx);
+                return;
+            }
+            if (!constraintPair && (int)model.constraints.size() >= 20) {
+                pushToast("Constraint limit reached (max 20 pairs)");
+                return;
+            }
+            // create the pair entry if it does not exist yet
+            if (!constraintPair) {
+                ConstraintPair newPair;
+                newPair.faceA = fA;
+                newPair.faceB = fB;
+                model.constraints.push_back(newPair);
+                constraintPair = &model.constraints.back();
+            }
+            if (kind == ConstraintKind::Distance) {
+                constraintPair->hasDistance = true;
+                constraintPair->targetDistance = computeCentroidDistance(model, fA, fB);
+            } else {
+                constraintPair->hasSymmetry = true;
+                float posA = computeAxialPos(model, fA, fA);
+                float posB = computeAxialPos(model, fB, fA);
+                constraintPair->symmetryMidpoint = (posA + posB) * 0.5f;
+            }
+        };
+        if (IsKeyPressed(KEY_D))
+            toggleKind(ConstraintKind::Distance);
+        if (IsKeyPressed(KEY_S))
+            toggleKind(ConstraintKind::Symmetry);
+    }
+}
+
+static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float& pitch, float& orbitRadius, bool& showNormals, bool& showBbox, float diagonal)
+{
+    handleDefaultControls(model, camera, yaw, pitch, orbitRadius, showNormals, showBbox, diagonal);
+    handle1SelectControls(model, diagonal);
+    handle2SelectControls(model);
+}
+
+#pragma region draw UI
+// top-right panel listing all active face-pair constraints as clickable buttons
+// clicking any entry removes all constraints for that pair, hover is highlighted
+// geometry constants must stay in sync with the panel click detection in handleControls
+static void drawConstraintPanel(const CadModel& model)
+{
+    const int panelRight = GetScreenWidth() - 20;
+    const int panelWidth = 220;
+    const int panelX = panelRight - panelWidth; // = screenW - 240
+    const int resetButtonH = 24;
+    const int entryH = 26, entryGap = 3;
+    const Color paleOrange = { 220, 170, 100, 255 };
+    int panelY = 20;
+
+    // reset button, full panel width, sits above the header
+    Vector2 mouse = GetMousePosition();
+    Rectangle resetRect = { (float)panelX, (float)panelY, (float)panelWidth, (float)resetButtonH };
+    bool resetHovered = CheckCollisionPointRec(mouse, resetRect);
+    DrawRectangleRec(resetRect, resetHovered ? Color { 90, 40, 40, 220 } : Color { 55, 28, 28, 200 });
+    DrawText("Reset scene", panelX + panelWidth / 2 - MeasureText("Reset scene", 14) / 2, panelY + 5, 14, Color { 220, 140, 140, 255 });
+    panelY += resetButtonH + 4;
+
+    DrawText(TextFormat("Constraints (%d/20)", (int)model.constraints.size()), panelX, panelY, 16, paleOrange);
+    panelY += 20; // header height, keep in sync with handleControls click detection
+
+    for (int i = 0; i < (int)model.constraints.size(); i++) {
+        const ConstraintPair& cp = model.constraints[i];
+        Rectangle entryRect = { (float)panelX, (float)panelY, (float)panelWidth, (float)entryH };
+        bool hovered = CheckCollisionPointRec(mouse, entryRect);
+        Color bgColor = hovered ? Color { 55, 55, 68, 210 } : Color { 32, 32, 44, 190 };
+        DrawRectangleRec(entryRect, bgColor);
+
+        int cx = panelX + 6;
+        int cy = panelY + 6;
+        // face A id
+        const char* faceAStr = TextFormat("#%d", cp.faceA);
+        DrawText(faceAStr, cx, cy, 14, LIGHTGRAY);
+        cx += MeasureText(faceAStr, 14) + 5;
+        // kind icons, 13x14 colored squares with a single letter, stacked horizontally
+        if (cp.hasDistance) {
+            DrawRectangle(cx, cy, 13, 14, ORANGE);
+            DrawText("D", cx + 2, cy + 1, 12, BLACK);
+            cx += 17;
+        }
+        if (cp.hasSymmetry) {
+            DrawRectangle(cx, cy, 13, 14, SKYBLUE);
+            DrawText("S", cx + 2, cy + 1, 12, BLACK);
+            cx += 17;
+        }
+        // face B id
+        DrawText(TextFormat("#%d", cp.faceB), cx + 4, cy, 14, LIGHTGRAY);
+
+        panelY += entryH + entryGap;
+    }
+}
+
+// fading toast notifications rendered at the bottom-center of the screen,
+// alpha ramps from 1 down to 0 over the final 0.5s of each toast's 3s lifetime
+static void drawToasts(const CadModel& model)
+{
+    int screenW = GetScreenWidth();
+    int toastY = GetScreenHeight() - 54;
+    for (const auto& t : model.toasts) {
+        float fading = t.timeLeft < 0.5f ? t.timeLeft / 0.5f : 1.0f;
+        unsigned char alpha = (unsigned char)(fading * 230);
+        int textW = MeasureText(t.message.c_str(), 16);
+        int toastX = (screenW - textW) / 2 - 10;
+        DrawRectangle(toastX, toastY - 5, textW + 20, 28, Color { 30, 30, 42, alpha });
+        DrawText(t.message.c_str(), toastX + 10, toastY, 16, Color { 255, 220, 80, alpha });
+        toastY -= 36; // stack upward when multiple toasts are active
+    }
+}
+
 static void drawUI(const CadModel& model)
 {
     // stats panel with running Y so adding lines never requires renumbering
+    // four blocks separated by a small gap, each block has its own color tier
+    // selectionless = pale lime, 1st selection = pale yellow, 2nd selection = pale orange
     int uiY = 20;
     const int uiStep = 20;
+    const int blockGap = 10;
+    const Color paleLime = { 160, 210, 130, 255 };
+    const Color paleYellow = { 220, 210, 130, 255 };
+    const Color paleOrange = { 220, 170, 100, 255 };
+
+    // block 1
     DrawText("RED = Cylinders", 20, uiY, 16, RED);
     uiY += uiStep;
     DrawText("GREEN = Tori (fillets)", 20, uiY, 16, GREEN);
@@ -619,81 +967,88 @@ static void drawUI(const CadModel& model)
     DrawText("BLUE = Planes", 20, uiY, 16, BLUE);
     uiY += uiStep;
     DrawText("DARKGRAY = Other", 20, uiY, 16, DARKGRAY);
-    uiY += uiStep + 6;
+    uiY += uiStep + blockGap;
 
-    DrawText(TextFormat("Faces: %d\nTriangles: %d", (int)model.meshes.size(), model.totalTriangleCount), 20, uiY, 16, LIGHTGRAY);
-    uiY += uiStep * 2; // because of the \n, applied down there too
+    // block 2
+    DrawText(TextFormat("Faces: %d\nTriangles: %d", (int)model.meshes.size(), model.totalTriangleCount), 20, uiY, 16, paleLime);
+    uiY += uiStep * 2; // two lines because of the \n
 
-    // model bbox dimensions and center recomputed each frame to reflect per-face offsets
     BoundingBox liveBbox = computeLiveModelBBox(model);
     Vector3 mCenter = modelCenter(model);
     DrawText(TextFormat("Width: %.2f\nHeight: %.2f\nDepth: %.2f mm", liveBbox.max.x - liveBbox.min.x, liveBbox.max.y - liveBbox.min.y,
                  liveBbox.max.z - liveBbox.min.z),
-        20, uiY, 16, LIGHTGRAY);
+        20, uiY, 16, paleLime);
     uiY += uiStep * 3;
     DrawText(TextFormat("Position: %.2f %.2f %.2f", (liveBbox.min.x + liveBbox.max.x) * 0.5f - mCenter.x, (liveBbox.min.y + liveBbox.max.y) * 0.5f - mCenter.y,
                  (liveBbox.min.z + liveBbox.max.z) * 0.5f - mCenter.z),
-        20, uiY, 16, LIGHTGRAY);
+        20, uiY, 16, paleLime);
     uiY += uiStep;
+    DrawText("Drag = orbit", 20, uiY, 16, paleLime);
+    uiY += uiStep;
+    DrawText("Scroll = zoom", 20, uiY, 16, paleLime);
+    uiY += uiStep;
+    DrawText("N = normals", 20, uiY, 16, paleLime);
+    uiY += uiStep;
+    DrawText("B = bbox", 20, uiY, 16, paleLime);
+    uiY += uiStep;
+    DrawText("RClick = select face", 20, uiY, 16, paleLime);
+    uiY += uiStep + blockGap;
 
-    DrawText("Drag = orbit", 20, uiY, 16, LIGHTGRAY);
-    uiY += uiStep;
-    DrawText("Scroll = zoom", 20, uiY, 16, LIGHTGRAY);
-    uiY += uiStep;
-    DrawText("N = normals", 20, uiY, 16, LIGHTGRAY);
-    uiY += uiStep;
-    DrawText("B = bounding box", 20, uiY, 16, LIGHTGRAY);
-    uiY += uiStep;
-    DrawText("RClick = select face", 20, uiY, 16, LIGHTGRAY);
-    uiY += uiStep;
-    DrawText("On selection:", 20, uiY, 16, YELLOW);
-    uiY += uiStep;
-    DrawText("Shift+RClick = get distance", 20, uiY, 16, LIGHTGRAY);
-    uiY += uiStep;
-    DrawText("Arrows/page keys = translate", 20, uiY, 16, LIGHTGRAY);
-    uiY += uiStep;
-    DrawText("Ctrl+U/Y = undo/redo", 20, uiY, 16, LIGHTGRAY);
-    uiY += uiStep;
+    // block 3
+    if (model.selectedFace > -1) {
+        int faceIdx = model.selectedFace;
+        int frontTris = (int)model.pickData[faceIdx].indices.size() / 6;
+        DrawText(TextFormat("Face #%d [%s]\nTriangles: %d\nSurface: %.2f mm^2", faceIdx, nameForKind(model.pickData[faceIdx].kind), frontTris,
+                     model.faceAreas[faceIdx]),
+            20, uiY, 16, paleYellow);
+        uiY += uiStep * 3;
 
-    if (model.selectedFace < 0)
-        return;
+        Vector3 center = modelCenter(model);
+        BoundingBox faceBbox = computeFaceBBox(model.pickData[faceIdx], center, model.faceOffsets[faceIdx]);
+        DrawText(TextFormat("Width: %.2f\nHeight: %.2f\nDepth: %.2f mm", faceBbox.max.x - faceBbox.min.x, faceBbox.max.y - faceBbox.min.y,
+                     faceBbox.max.z - faceBbox.min.z),
+            20, uiY, 16, paleYellow);
+        uiY += uiStep * 3;
+        DrawText(TextFormat("Position: %.2f, %.2f, %.2f", (faceBbox.min.x + faceBbox.max.x) * 0.5f, (faceBbox.min.y + faceBbox.max.y) * 0.5f,
+                     (faceBbox.min.z + faceBbox.max.z) * 0.5f),
+            20, uiY, 16, paleYellow);
+        uiY += uiStep;
 
-    uiY += 6;
-    int faceIdx = model.selectedFace;
-    int frontTris = (int)model.pickData[faceIdx].indices.size() / 6;
-    DrawText(
-        TextFormat("Face #%d [%s]\nTriangles: %d\nSurface: %.2f mm^2", faceIdx, nameForKind(model.pickData[faceIdx].kind), frontTris, model.faceAreas[faceIdx]),
-        20, uiY, 16, YELLOW);
-    uiY += uiStep * 3;
+        DrawText("Arrows/page keys = translate", 20, uiY, 16, paleYellow);
+        uiY += uiStep;
+        DrawText("Ctrl+U/Y = undo/redo", 20, uiY, 16, paleYellow);
+        uiY += uiStep;
+        DrawText("Shift+RClick = select 2nd face", 20, uiY, 16, paleYellow);
+        uiY += uiStep + blockGap;
+    }
 
-    // face bbox dimensions and center (in draw space = relative to model center = world coords when model at origin)
-    // offset applied so stats match the visual position of the face after push/pull
-    Vector3 center = modelCenter(model);
-    BoundingBox faceBbox = computeFaceBBox(model.pickData[faceIdx], center, model.faceOffsets[faceIdx]);
-    DrawText(TextFormat("Width: %.2f\nHeight: %.2f\nDepth: %.2f mm", faceBbox.max.x - faceBbox.min.x, faceBbox.max.y - faceBbox.min.y,
-                 faceBbox.max.z - faceBbox.min.z),
-        20, uiY, 16, YELLOW);
-    uiY += uiStep * 3;
-    DrawText(TextFormat("Position: %.2f, %.2f, %.2f", (faceBbox.min.x + faceBbox.max.x) * 0.5f, (faceBbox.min.y + faceBbox.max.y) * 0.5f,
-                 (faceBbox.min.z + faceBbox.max.z) * 0.5f),
-        20, uiY, 16, YELLOW);
-    uiY += uiStep;
-
-    if (model.distFace > -1) {
+    // block 4
+    if (model.selectedFace > -1 && model.distFace > -1) {
         float dist = computeFaceMinDistance(
             model.pickData[model.selectedFace], model.pickData[model.distFace], model.faceOffsets[model.selectedFace], model.faceOffsets[model.distFace]);
-        DrawText(TextFormat("Distance to #%d: %.4f mm", model.distFace, dist), 20, uiY, 16, ORANGE);
+        DrawText(TextFormat("Distance to #%d: %.4f mm", model.distFace, dist), 20, uiY, 16, paleOrange);
+        uiY += uiStep;
+        DrawText("D = distance constraint", 20, uiY, 16, paleOrange);
+        uiY += uiStep;
+        DrawText("S = symmetry constraint", 20, uiY, 16, paleOrange);
+        uiY += uiStep;
     }
+
+    // drawn last so they render on top of all other UI
+    drawConstraintPanel(model);
+    drawToasts(model);
 }
 
 #pragma region main
 int main()
 {
+    SetTraceLogLevel(LOG_WARNING);
     InitWindow(1280, 720, "CAD");
     SetTargetFPS(60);
 
     // executable either at root or in build/Release idk xd
-    CadModel model = loadStep(std::filesystem::exists("cad/cad.step") ? "cad/cad.step" : "../../cad/cad.step");
+    const std::string stepPath = std::filesystem::exists("cad/cad.step") ? "cad/cad.step" : "../../cad/cad.step";
+    CadModel model = loadStep(stepPath);
 
     Vector3 modelSize = { model.bbox.max.x - model.bbox.min.x, model.bbox.max.y - model.bbox.min.y, model.bbox.max.z - model.bbox.min.z };
     // diagonal of the bounding box, aka "diameter" from one corner to the opposite,
@@ -701,44 +1056,65 @@ int main()
     // ex: bbox 10x5x2 -> diagonal = sqrt(100+25+4) = 11.36
     float diagonal = sqrtf(modelSize.x * modelSize.x + modelSize.y * modelSize.y + modelSize.z * modelSize.z);
 
-    // default camera state, feel-tuned
+    auto initCamera = [&]() {
+        // default camera state, feel-tuned
+        Camera3D cam = {};
+        cam.target = { 0, 0, 0 };
+        cam.up = { 0, 1, 0 };
+        cam.fovy = 45;
+        cam.projection = CAMERA_PERSPECTIVE;
+        return cam;
+    };
+
     float yaw = 45.0f; // degrees, horizontal rotation
     float pitch = -25.0f; // degrees, vertical rotation
     float orbitRadius = diagonal * 1.8f; // initial distance
-    Camera3D camera = {};
-    camera.target = { 0, 0, 0 };
-    camera.up = { 0, 1, 0 };
-    camera.fovy = 45;
-    camera.projection = CAMERA_PERSPECTIVE;
+    Camera3D camera = initCamera();
 
     bool showNormals = false, showBbox = false;
 
     while (!WindowShouldClose()) {
+        // reload the model and reinitialise all camera and view state from scratch
+        if (model.needsReset) {
+            model = loadStep(stepPath);
+            modelSize = { model.bbox.max.x - model.bbox.min.x, model.bbox.max.y - model.bbox.min.y, model.bbox.max.z - model.bbox.min.z };
+            diagonal = sqrtf(modelSize.x * modelSize.x + modelSize.y * modelSize.y + modelSize.z * modelSize.z);
+            yaw = 45.0f;
+            pitch = -25.0f;
+            orbitRadius = diagonal * 1.8f;
+            camera = initCamera();
+            showNormals = false;
+            showBbox = false;
+        }
         handleControls(model, camera, yaw, pitch, orbitRadius, showNormals, showBbox, diagonal);
 
         BeginDrawing();
-        ClearBackground({ 18, 18, 22, 255 });
-        BeginMode3D(camera);
-        drawCadModel(model);
-        drawSelectedFaceHighlight(model);
-        if (model.distFace > -1)
-            drawDistFaceHighlight(model);
-        if (showBbox) {
-            if (model.selectedFace > -1)
-                drawFaceBbox(model);
-            else
-                drawModelBbox(model);
-        }
-        if (showNormals) {
-            if (model.selectedFace > -1) {
-                drawFaceNormals(model, diagonal * 0.03f);
-                drawFaceAnalyticalAxis(model, diagonal * 0.15f);
-            } else {
-                drawModelAverageNormal(model, diagonal * 0.3f);
+        {
+            ClearBackground({ 18, 18, 22, 255 });
+            BeginMode3D(camera);
+            {
+                drawCadModel(model);
+                drawSelectedFaceHighlight(model);
+                if (model.distFace > -1)
+                    drawDistFaceHighlight(model);
+                if (showBbox) {
+                    if (model.selectedFace > -1)
+                        drawFaceBbox(model);
+                    else
+                        drawModelBbox(model);
+                }
+                if (showNormals) {
+                    if (model.selectedFace > -1) {
+                        drawFaceNormals(model, diagonal * 0.03f);
+                        drawFaceAnalyticalAxis(model, diagonal * 0.15f);
+                    } else {
+                        drawModelAverageNormal(model, diagonal * 0.3f);
+                    }
+                }
             }
+            EndMode3D();
+            drawUI(model);
         }
-        EndMode3D();
-        drawUI(model);
         EndDrawing();
     }
     CloseWindow();

@@ -28,7 +28,10 @@ Available targets:
 </p>
 
 Minimal [STEP](https://en.wikipedia.org/wiki/ISO_10303) file loader (cylinders, planes and tori with their relevant keywords for rendering, everything else (styling, metadata, presentation, [assembly](https://en.wikipedia.org/wiki/Assembly_modelling)) is ignored) and [tessellator](https://en.wikipedia.org/wiki/Tessellation_(computer_graphics)) for [B-rep](https://en.wikipedia.org/wiki/Boundary_representation) to [mesh](https://en.wikipedia.org/wiki/Polygon_mesh) visualization.\
-Completed by [face selection](https://en.wikipedia.org/wiki/Ray_casting) for distance between them and translation involving rudimentary plane-cylinder [geometry healing](https://en.wikipedia.org/wiki/Mesh_generation) (no [constraints](https://en.wikipedia.org/wiki/Constraint_(computer-aided_design)), must be aligned), as well as convenient controls and measurements in the UI.
+Completed by:
+- convenient controls and measurements in the UI,
+- [face selection](https://en.wikipedia.org/wiki/Ray_casting) for 3D [translation](https://en.wikipedia.org/wiki/Translation_(geometry)) involving rudimentary plane-cylinder [geometry healing](https://en.wikipedia.org/wiki/Mesh_generation)), as well as [undo/redo](https://en.wikipedia.org/wiki/Undo).
+- 2nd face selection for [centroid-centroid](https://en.wikipedia.org/wiki/Centroid) distance to the first and distance/symmetry translation [constraints](https://en.wikipedia.org/wiki/Constraint_(computer-aided_design)).
 
 # <p align="center">🦾 Kinematic 🏁</p>
 
