@@ -161,7 +161,7 @@ static std::vector<std::array<int, 3>> earClip(const std::vector<Vec2>& polygon)
 
 // O'Rourke visible-vertex bridge algorithm for hole merging:
 // we need to connect a hole to the outer polygon without the connection line crossing any existing edge
-// - start from the rightmost point of the hole and shoota ray to the right
+// - start from the rightmost point of the hole and shoot a ray to the right
 // - find which outer polygon edge the ray hits first
 // - of the two endpoints of that edge, pick the one further right, that vertex is visible from your hole point by construction (the ray guarantees it)
 // - draw the bridge there
@@ -169,14 +169,13 @@ static std::vector<std::array<int, 3>> earClip(const std::vector<Vec2>& polygon)
 // ex: outer square [A, B, C, D] and a triangular hole [H0, H1, H2] where B is the chosen bridge target and H0 is the chosen hole start,
 // the merged polygon becomes [A, B, H0, H1, H2, H0, B, C, D], B and H0 appear twice (the seams), B->H0 and H0->B are the bridge
 
-// when you have a polygon with a hole in it, the ear-clipper can only handle simple polygons (no holes)
+// when you have a polygon with a hole in it, the ear-clipper can only handle simple polygons (no holes),
 // a bridge cut is a straight line segment that connects a point on the hole boundary to a point on the outer boundary,
-// now it has no hole, just a slightly more complex outline that the ear-clipper can handle normally
+// now it has no hole, just a slightly more complex outline that the ear-clipper can handle normally,
 // since it produce degenerate zero-area ears (the two duplicate vertices are collinear), the ear-clipper skips without emitting a triangle for them
 
 // given the current (possibly already-merged) outer polygon and the +X ray origin rayOrigin,
-// returns the index of the polygon vertex that is the best bridge target:
-// the vertex of the first edge hit by the ray that has the larger X coordinate
+// returns the index of the polygon vertex that is the best bridge target (the vertex of the first edge hit by the ray that has the larger X coordinate)
 // ex: rayOrigin=(3,1), outer square [(0,0),(5,0),(5,3),(0,3)]
 //     ray hits edge (5,0)-(5,3) at x=5 -> both endpoints have same U, pick (5,3) via >= check
 static int findBridgeVertex(const std::vector<Vec2>& polygon, Vec2 rayOrigin)
@@ -187,7 +186,7 @@ static int findBridgeVertex(const std::vector<Vec2>& polygon, Vec2 rayOrigin)
 
     for (int i = 0; i < vertexCount; i++) {
         Vec2 edgeStart = polygon[i], edgeEnd = polygon[(i + 1) % vertexCount];
-        // only consider edges that straddle rayOrigin's V coordinate (can be hit by horizontal ray).
+        // only consider edges that straddle rayOrigin's V coordinate (can be hit by horizontal ray)
         // ex: rayOrigin.v=1, edge from (2,0) to (2,3) -> straddles (0<=1<3), keep
         //     rayOrigin.v=1, edge from (2,2) to (4,3) -> both above rayOrigin.v, skip
         if ((edgeStart.v <= rayOrigin.v && edgeEnd.v <= rayOrigin.v) || (edgeStart.v > rayOrigin.v && edgeEnd.v > rayOrigin.v))
@@ -199,7 +198,7 @@ static int findBridgeVertex(const std::vector<Vec2>& polygon, Vec2 rayOrigin)
             continue;
         double param = (rayOrigin.v - edgeStart.v) / deltaV;
         double xHit = edgeStart.u + (edgeEnd.u - edgeStart.u) * param;
-        // distanceAlongRay is the signed distance along +X from rayOrigin to the hit; skip edges to the left
+        // distanceAlongRay is the signed distance along +X from rayOrigin to the hit, skip edges to the left
         // ex: rayOrigin.u=3, xHit=5 -> distanceAlongRay=+2 (to the right, valid hit)
         //     rayOrigin.u=3, xHit=1 -> distanceAlongRay=-2 (to the left, skip)
         double distanceAlongRay = xHit - rayOrigin.u;
@@ -234,14 +233,13 @@ static int findBridgeVertex(const std::vector<Vec2>& polygon, Vec2 rayOrigin)
 
 // merge hole polygons into the outer polygon via bridge cuts (O'Rourke method),
 // sort holes rightmost-first so each bridge is inserted before any hole to its left
-// ex: washer face = outer square + 1 circular hole -> returns one merged polygon with a seam cut
+// ex: the plane donuts at the start/end of our LeadScrew = outer circle + 1 hole -> returns one merged polygon with a cut
 static std::vector<Vec2> buildMergedPolygon(const std::vector<Vec2>& outer, const std::vector<std::vector<Vec2>>& holes)
 {
     if (holes.empty())
         return outer;
 
-    // sort holes by their rightmost X coordinate, descending
-    // this ensures bridge cuts from right-side holes don't cross left-side holes
+    // sort holes by their rightmost X coordinate (descending), this ensures bridge cuts from right-side holes don't cross left-side holes
     // ex: two holes with rightmost X=8 and X=3 -> process X=8 hole first
     std::vector<int> holeOrder((int)holes.size());
     std::iota(holeOrder.begin(), holeOrder.end(), 0);
@@ -266,14 +264,12 @@ static std::vector<Vec2> buildMergedPolygon(const std::vector<Vec2>& outer, cons
                 rightmostId = i;
         Vec2 bridgeSource = hole[rightmostId];
 
-        // find visible bridge vertex on the outer polygon using ray casting
+        // O'Rourke, find visible bridge vertex on the outer polygon using ray casting
         int bridgeTargetId = findBridgeVertex(merged, bridgeSource);
 
         // splice hole into merged polygon at bridgeTargetId:
         // outer[0 to bridgeTargetId] -> hole[rightmostId to rightmostId-1] -> hole[rightmostId] (seam) -> outer[bridgeTargetId to end]
-        // the duplicated vertices are what create the "bridge cut"
-        // ex: outer=[A,B,C,D], bridgeTargetId=1 (=B), hole=[H0,H1,H2], rightmostId=0
-        //  -> [A, B, H0,H1,H2, H0, B, C, D]  (B and H0 each appear twice = the two seam edges)
+        // the duplicated vertices are what create the "bridge cut", see example comment above findBridgeVertex
         std::vector<Vec2> spliced;
         spliced.reserve(merged.size() + hole.size() + 2);
         for (int i = 0; i <= bridgeTargetId; i++)
@@ -287,9 +283,8 @@ static std::vector<Vec2> buildMergedPolygon(const std::vector<Vec2>& outer, cons
         merged = std::move(spliced);
     }
 
-    // remove consecutive near-duplicate vertices (bridge seam creates pairs like [A, A]),
-    // keeping them causes zero-area ears that stall the ear-clipper
-    // ex: [..., B, B, ...] -> [..., B, ...]  (one of the two bridge-seam duplicates removed)
+    // remove consecutive near-duplicate vertices (bridge seam creates pairs like [A, A]), keeping them causes zero-area ears that stall the ear-clipper
+    // ex: [..., B, B, ...] -> [..., B, ...] (one of the two bridge-seam duplicates removed)
     std::vector<Vec2> deduped;
     deduped.reserve(merged.size());
     for (int i = 0; i < (int)merged.size(); i++) {
@@ -510,7 +505,7 @@ static TessellatedFace tessCylinder(const Surface& surface, const std::vector<Bo
     Vec3 Y = Z.cross(X).norm();
     double radius = surface.majorRadius;
 
-    // compute height range [heightMin, heightMax] by projecting all boundary points onto the cylinder axis
+    // compute height range [heightMin, heightMax] by projecting all boundary points onto the cylinder axis, same as done in loadStep
     // ex: screw shank with top boundary at h=10 and bottom at h=0 -> heightMin=0, heightMax=10
     double heightMin = std::numeric_limits<double>::max(), heightMax = -std::numeric_limits<double>::max();
     bool fullRevolution = false;
@@ -526,7 +521,7 @@ static TessellatedFace tessCylinder(const Surface& surface, const std::vector<Bo
     if (heightMax - heightMin < 1e-8)
         return {};
 
-    // angle range: full revolution or derive from boundary points
+    // angle range, full revolution or derive from boundary points
     double angleMin = 0, angleMax = 2 * M_PI;
     int uCount = uSegments;
     if (!fullRevolution) {
@@ -540,8 +535,7 @@ static TessellatedFace tessCylinder(const Surface& surface, const std::vector<Bo
                 rawAngleMin = std::min(rawAngleMin, angle);
                 rawAngleMax = std::max(rawAngleMax, angle);
             }
-        // if the arc span covers almost the full circle, treat as full revolution
-        // to avoid the gap caused by atan2 wrapping near +-pi
+        // if the arc span covers almost the full circle, treat as full revolution  to avoid the gap caused by atan2 wrapping near +-pi
         // ex: rawAngleMin=-3.1, rawAngleMax=3.1 -> span=6.2 > 1.9*pi=5.97 -> full revolution
         if (rawAngleMax - rawAngleMin > 1.9 * M_PI) {
             angleMin = 0;
@@ -550,13 +544,14 @@ static TessellatedFace tessCylinder(const Surface& surface, const std::vector<Bo
             angleMin = rawAngleMin;
             angleMax = rawAngleMax;
         }
-        // scale segment count to the actual arc fraction of a full circle.
+        // scale segment count to the actual arc fraction of a full circle
         // ex: uSegments=48, half-circle arc (pi out of 2pi) -> uCount = max(2, 48*0.5) = 24
         uCount = std::max(2, (int)(uSegments * (angleMax - angleMin) / (2 * M_PI)));
     }
 
     // cylinder surface: positionFn(u,v) = origin + radius*(cos(u)*X + sin(u)*Y) + v*Z
     // u = angle around axis [angleMin to angleMax], v = height along axis [heightMin to heightMax]
+    // TODO: we already do such computations in samplecircle, maybe there could be a cleaner refactor than doing it a 2nd time here
     auto positionFn = [&](double u, double v) -> Vec3 {
         Vec3 radialDir = X * std::cos(u) + Y * std::sin(u);
         return origin + radialDir * radius + Z * v;
@@ -582,32 +577,12 @@ static TessellatedFace tessTorus(const Surface& surface, int uSegments, int vSeg
     };
     // outward normal: radial component in XY plane scaled by cos(v), plus axial Z*sin(v)
     // ex: v=0 (outer equator) -> normal = radialDir (purely radial outward)
-    //     v=pi/2 (top of tube) ->  normal = Z         (purely axial upward)
+    //     v=pi/2 (top of tube) -> normal = Z (purely axial upward)
     auto normalFn = [&](double u, double v) -> Vec3 {
         Vec3 radialDir = X * std::cos(u) + Y * std::sin(u);
         return (radialDir * std::cos(v) + Z * std::sin(v)).norm();
     };
     return tessGrid(SurfaceKind::Torus, positionFn, normalFn, 0, 2 * M_PI, uSegments, 0, 2 * M_PI, vSegments);
-}
-
-#pragma region gpu upload
-// sums the area of all front-face triangles (first half of the index list, back-face duplicates are the second half)
-// exact for planar faces (ear-clip triangulates the exact boundary), approximate for curved surfaces (depends on arcSegs)
-float computeFaceArea(const TessellatedFace& face)
-{
-    // accumulate in double to reduce error on large faces, cast to float only at the final return
-    double area = 0.0;
-    // total triangles / 2 = front-face triangles only (back faces are duplicated with reversed winding in the second half)
-    int frontTriCount = (int)face.indices.size() / 6;
-    for (int i = 0; i < frontTriCount; i++) {
-        int base = i * 3;
-        int i0 = face.indices[base] * 3, i1 = face.indices[base + 1] * 3, i2 = face.indices[base + 2] * 3;
-        Vec3 v0 = { face.vertices[i0], face.vertices[i0 + 1], face.vertices[i0 + 2] };
-        Vec3 v1 = { face.vertices[i1], face.vertices[i1 + 1], face.vertices[i1 + 2] };
-        Vec3 v2 = { face.vertices[i2], face.vertices[i2 + 1], face.vertices[i2 + 2] };
-        area += 0.5 * (v1 - v0).cross(v2 - v0).len(); // triangle area formula
-    }
-    return (float)area;
 }
 
 // allocates and fills a Raylib Mesh from a TessellatedFace, then uploads it from CPU RAM to the GPU's to draw it later
@@ -765,9 +740,8 @@ static bool facesShareVertex(const TessellatedFace& planeData, Vector3 planeOff,
     return false;
 }
 
-// builds the heal cache for the selected plane face at gesture start (rising edge of the translation)
-// scans all cylinders once, checks axis alignment and vertex adjacency at the current (initial) position,
-// records which cap each connected cylinder should extend so per-frame updates need no proximity work at all
+// builds the heal cache for the selected plane face at gesture start, scans all cylinders once, checks axis alignment and vertex adjacency at the current
+// (initial) position, records which cap each connected cylinder should extend so per-frame updates need no proximity work at all
 std::vector<CylinderHealEntry> buildCylinderHealCache(const CadModel& model, int planeFaceId)
 {
     std::vector<CylinderHealEntry> cache;
@@ -897,4 +871,24 @@ TessellatedFace tessellateAdvancedFace(int faceId, const StepMap& map, int arcSe
         // unknown surface type, return empty rather than silently tessellating with the wrong model
         return {};
     }
+}
+
+#pragma region gpu upload
+// sums the area of all front-face triangles (first half of the index list, back-face duplicates are the second half)
+// exact for planar faces (ear-clip triangulates the exact boundary), approximate for curved surfaces (depends on arcSegs)
+float computeFaceArea(const TessellatedFace& face)
+{
+    // accumulate in double to reduce error on large faces, cast to float only at the final return
+    double area = 0.0;
+    // total triangles / 2 = front-face triangles only (back faces are duplicated with reversed winding in the second half)
+    int frontTriCount = (int)face.indices.size() / 6;
+    for (int i = 0; i < frontTriCount; i++) {
+        int base = i * 3;
+        int i0 = face.indices[base] * 3, i1 = face.indices[base + 1] * 3, i2 = face.indices[base + 2] * 3;
+        Vec3 v0 = { face.vertices[i0], face.vertices[i0 + 1], face.vertices[i0 + 2] };
+        Vec3 v1 = { face.vertices[i1], face.vertices[i1 + 1], face.vertices[i1 + 2] };
+        Vec3 v2 = { face.vertices[i2], face.vertices[i2 + 1], face.vertices[i2 + 2] };
+        area += 0.5 * (v1 - v0).cross(v2 - v0).len(); // shoelace triangle area formula
+    }
+    return (float)area;
 }
