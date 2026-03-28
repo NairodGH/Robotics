@@ -708,6 +708,7 @@ void retessCylinderFace(CadModel& model, int cylId, double newHeightMin, double 
     model.meshes[cylId] = uploadMesh(newFace);
     model.cpuFaceData[cylId] = newFace;
     model.faceAreas[cylId] = computeFaceArea(newFace);
+    model.rawFaceCentroids[cylId] = computeRawFaceCentroid(newFace);
     model.cylHeightRanges[cylId] = { newHeightMin, newHeightMax };
 }
 

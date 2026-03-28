@@ -142,6 +142,7 @@ struct CadModel {
     std::vector<Surface> faceSurfaces; // analytical surface definition per face, for axis/normal display
     std::vector<float> faceAreas;
     std::vector<Vector3> faceOffsets; // per-face translation in draw space, applied on top of the centering transform at draw/query time
+    std::vector<Vector3> rawFaceCentroids; // mean vertex position in STEP space (no offset, no centering), computed once at load and after retesselation
     std::vector<CylinderHeightRange> cylHeightRanges; // per-face cylinder axis height range, kept mutable for geometry healing, non-cylinders are zeroed
 
     // per-gesture working states, stack persists for undo/redo
@@ -160,6 +161,8 @@ struct CadModel {
     int selectedFace = -1;
     int secondFace = -1;
     bool needsReset = false; // "persistent" for 1 frame lmao
+    float cachedMinDistance = 0.0f; // last computed face-pair distance, valid when !distanceDirty
+    bool distanceDirty = true; // set true whenever either selected face's offset changes
 
     // load-time centering anchor set once during loadStep from raw STEP vertex positions (no offsets),
     // used only to derive modelCenter() which is the fixed origin for all draw-space transforms,
@@ -188,6 +191,7 @@ struct CadModel {
 // cad.cpp
 CadModel loadStep(const std::string& path, int arcSegs = 48);
 void drawCadModel(const CadModel& model);
+Vector3 computeRawFaceCentroid(const TessellatedFace& face);
 
 // parser.cpp
 std::vector<std::string> splitTopLevel(const std::string& input);
