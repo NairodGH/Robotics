@@ -605,8 +605,9 @@ Mesh uploadMesh(const TessellatedFace& tessellatedFace)
     mesh.triangleCount = triangleCount;
     mesh.vertices = (float*)RL_MALLOC(vertexCount * 3 * sizeof(float));
     mesh.normals = (float*)RL_MALLOC(vertexCount * 3 * sizeof(float));
-    // raylib uses unsigned short indices: max 65535 vertices per mesh
+    // raylib uses unsigned short indices so max 65535 vertices per mesh
     // ex: a dense torus with uSegments=48, vSegments=24 -> 2*49*25=2450 verts, well within the limit
+    assert(vertexCount <= 65535 && "mesh vertex count exceeds unsigned short range, raise arcSegs or split the face");
     mesh.indices = (unsigned short*)RL_MALLOC(triangleCount * 3 * sizeof(unsigned short));
     memcpy(mesh.vertices, tessellatedFace.vertices.data(), vertexCount * 3 * sizeof(float));
     memcpy(mesh.normals, tessellatedFace.normals.data(), vertexCount * 3 * sizeof(float));

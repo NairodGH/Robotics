@@ -363,6 +363,7 @@ static float computeFaceMinDistance(
     const TessellatedFace& faceA, const TessellatedFace& faceB, Vector3 offsetA = { 0.0f, 0.0f, 0.0f }, Vector3 offsetB = { 0.0f, 0.0f, 0.0f })
 {
     float minDistance = std::numeric_limits<float>::max();
+    float epsilon = std::numeric_limits<float>::max();
     int countA = (int)faceA.vertices.size() / 6; // front vertices only
     int countB = (int)faceB.vertices.size() / 6;
     for (int i = 0; i < countA; i++) {
@@ -378,12 +379,13 @@ static float computeFaceMinDistance(
             // the sphere (your current best distance) fits inside a cube whose side equals the diameter, if you're already outside the cube on any single wall
             // then you're outside the sphere, checking one wall costs one abs
             // (which is cheaper than even a multiplication because it's just zeroing one bit of the float)
-            float epsilon = sqrtf(minDistance);
             if (std::abs(distanceX) >= epsilon || std::abs(distanceY) >= epsilon || std::abs(distanceZ) >= epsilon)
                 continue;
             float distance = distanceX * distanceX + distanceY * distanceY + distanceZ * distanceZ;
-            if (distance < minDistance)
+            if (distance < minDistance) {
                 minDistance = distance;
+                epsilon = sqrtf(minDistance);
+            }
         }
     }
     return sqrtf(minDistance);
@@ -718,7 +720,8 @@ static void handle1SelectControls(CadModel& model, float diagonal)
                 }
                 // all propagated cache contributions one entry per cache that owns a cap (end circle) of this cylinder (so up to two)
                 for (auto& [cacheId, cacheEntries] : model.propagatedHealCaches) {
-                    double propagatedAxialDelta = propagatedAxialDeltas.count(cacheId) ? propagatedAxialDeltas.at(cacheId) : 0.0;
+                    auto axialIt = propagatedAxialDeltas.find(cacheId);
+                    double propagatedAxialDelta = (axialIt != propagatedAxialDeltas.end()) ? axialIt->second : 0.0;
                     for (auto& propagatedEntry : cacheEntries) {
                         if (propagatedEntry.cylFaceId != cylId)
                             continue;
@@ -757,7 +760,8 @@ static void handle1SelectControls(CadModel& model, float diagonal)
             // update offsets for all propagated faces in a separate pass, decoupled from healing so
             // moves that don't push along the axis still shift the face offset correctly
             for (auto& [cacheId, cacheEntries] : model.propagatedHealCaches) {
-                const Vector3& offsetDelta = propagatedOffsetsDeltas.count(cacheId) ? propagatedOffsetsDeltas.at(cacheId) : Vector3 { 0, 0, 0 };
+                auto offsetIt = propagatedOffsetsDeltas.find(cacheId);
+                const Vector3& offsetDelta = (offsetIt != propagatedOffsetsDeltas.end()) ? offsetIt->second : Vector3 { 0, 0, 0 };
                 model.faceOffsets[cacheId].x += offsetDelta.x;
                 model.faceOffsets[cacheId].y += offsetDelta.y;
                 model.faceOffsets[cacheId].z += offsetDelta.z;
